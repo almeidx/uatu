@@ -1,0 +1,60 @@
+# Test fixture: the sample config from SPEC §4, verbatim semantics.
+[global]
+data_dir = "~/.local/state/uatu"
+host_name = "prod-worker-01"
+capture_stdout = true
+capture_stderr = true
+capture_mode = "capped"
+capture_head_bytes = "64KiB"
+capture_tail_bytes = "1MiB"
+min_free_bytes = "100MB"
+kill_grace = "30s"
+
+[retention]
+max_age = "30d"
+max_bytes = "1GB"
+
+[log]
+path = "~/.local/state/uatu/uatu.jsonl"
+max_bytes = "50MB"
+trim = "head"
+
+[redaction]
+literals = [
+  "literal-token-to-hide"
+]
+regex = [
+  '''password=[^[:space:]]+''',
+  '''Authorization: Bearer [A-Za-z0-9._-]+'''
+]
+
+[notify]
+events = ["success", "failure"]
+reporters = ["discord.default", "smtp.ops"]
+failure_output = true
+
+[reporters.discord.default]
+webhook_url = "https://discord.com/api/webhooks/..."
+max_message_chars = 3500
+
+[reporters.smtp.ops]
+host = "smtp.example.com"
+port = 587
+tls = "starttls"
+username = "uatu@example.com"
+password = "smtp-password"
+from = "uatu@example.com"
+recipients = ["ops@example.com"]
+max_message_chars = 20000
+events = ["failure", "recovery", "stale"]
+
+[jobs.nightly-backup]
+cwd = "/srv/app"
+env = { RUST_LOG = "info" }
+timeout = "2h"
+expected_duration = "45m"
+schedule_label = "nightly at 02:00"
+reporters = ["discord.default", "smtp.ops"]
+events = ["success", "failure", "recovery", "stale", "long_run"]
+capture_stdout = true
+capture_stderr = true
