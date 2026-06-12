@@ -346,7 +346,10 @@ fn newer_db_schema_degrades_safely() {
     assert!(err.contains("older than its database"), "{err}");
 }
 
+// Linux-only: pid-reuse/reboot detection needs /proc liveness identity; the
+// macOS dev fallback is a bare kill(0) and keeps these wrappers "alive".
 #[test]
+#[cfg(target_os = "linux")]
 fn stale_detection_pid_reuse_and_reboot() {
     let server = FakeDiscord::start(vec![]);
     let env = TestEnv::new();

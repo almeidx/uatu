@@ -54,12 +54,11 @@ pub fn is_alive(pid: i32, start_ticks: u64, boot_id_stored: &str) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn current_process_is_alive() {
         let me = current();
         assert!(me.start_ticks > 0);
@@ -68,7 +67,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn pid_reuse_and_reboot_detected_as_dead() {
         let me = current();
         // Same pid, wrong start time (pid reuse simulation):

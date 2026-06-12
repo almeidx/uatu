@@ -25,6 +25,8 @@ pub const STATUSES: [&str; 6] = [
 pub enum StateError {
     /// Database written by a newer uatu (SPEC §7 migrations): degrade safely.
     NewerSchema(i64),
+    /// SQLITE_BUSY/LOCKED — retryable, unlike other state failures.
+    Busy(String),
     Other(String),
 }
 
@@ -35,14 +37,18 @@ impl std::fmt::Display for StateError {
                 f,
                 "uatu is older than its database (db schema v{v}, binary supports v{SCHEMA_VERSION}); upgrade uatu"
             ),
-            StateError::Other(e) => write!(f, "{e}"),
+            StateError::Busy(e) | StateError::Other(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl From<rusqlite::Error> for StateError {
     fn from(e: rusqlite::Error) -> Self {
-        StateError::Other(e.to_string())
+        use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked};
+        match e.sqlite_error_code() {
+            Some(DatabaseBusy | DatabaseLocked) => StateError::Busy(e.to_string()),
+            _ => StateError::Other(e.to_string()),
+        }
     }
 }
 
@@ -129,7 +135,26 @@ impl Db {
                 .mode(0o600)
                 .open(path);
         }
-        let conn = Connection::open(path).map_err(|e| StateError::Other(e.to_string()))?;
+        // The first WAL switch on a fresh db needs a SHARED→EXCLUSIVE lock
+        // upgrade; when two processes race it, SQLite returns BUSY immediately
+        // (deadlock avoidance) without consulting the busy handler, so
+        // busy_timeout alone cannot cover the top-of-the-hour burst on a fresh
+        // state dir (SPEC §7). Retry the whole open with the same 5s budget.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+        let mut delay = std::time::Duration::from_millis(5);
+        loop {
+            match Self::open_once(path) {
+                Err(StateError::Busy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn open_once(path: &Path) -> Result<Db, StateError> {
+        let conn = Connection::open(path)?;
         // busy_timeout FIRST: the WAL switch and migration below take write
         // locks, and concurrent wrappers racing on a fresh database (the
         // top-of-the-hour burst, SPEC §7) must retry instead of failing.

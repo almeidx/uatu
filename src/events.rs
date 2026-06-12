@@ -245,7 +245,7 @@ pub fn discord_payload(ctx: &MsgCtx, max_message_chars: Option<usize>) -> serde_
     let mut description = desc_lines.join("\n");
 
     if let Some((out, err)) = &ctx.snippets {
-        let budget = cap.saturating_sub(description.chars().count() + 200).max(0);
+        let budget = cap.saturating_sub(description.chars().count() + 200);
         let each = (budget / 2).min(900);
         if !out.is_empty() && each > 40 {
             description.push_str(&format!(
