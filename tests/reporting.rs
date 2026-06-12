@@ -773,3 +773,28 @@ fn prune_dry_run_and_real() {
     );
     assert!(env.db().get_run(&run_id).unwrap().is_none(), "row deleted");
 }
+
+#[test]
+fn delivery_errors_never_store_the_webhook_secret() {
+    // A webhook URL whose port refuses connections: bind, take the port,
+    // drop the listener. reqwest connect errors embed the URL unless
+    // stripped/redacted — the token must never reach the database.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{port}/api/webhooks/1/sekrit-token");
+    let env = TestEnv::new();
+    env.write_config(&discord_config(&url, r#"["success"]"#));
+    let (code, _out, _err) = env.run_code(&["run", "--name", "leaky", "--", "true"]);
+    assert_eq!(code, 0);
+    let db = env.db();
+    let err: String = db
+        .conn
+        .query_row("SELECT last_error FROM deliveries", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        !err.contains("sekrit-token"),
+        "webhook token persisted in last_error: {err}"
+    );
+}

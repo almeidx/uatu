@@ -281,6 +281,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
                 &msg,
                 reporters_enabled,
                 db_ok,
+                &redactor,
             );
         }
     }
@@ -308,6 +309,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
                 &msg,
                 reporters_enabled,
                 db_ok,
+                &redactor,
             );
         }
     };
@@ -515,6 +517,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             &events_to_send,
             eff.expected_from_cli,
             interrupted_by.is_some(),
+            &redactor,
         );
     }
 
@@ -844,7 +847,7 @@ fn fire_long_run(
     cfg: &Config,
     run_id: &str,
     job_id: &str,
-    _redactor: &Arc<Redactor>,
+    redactor: &Arc<Redactor>,
     reporters_enabled: bool,
     expected_from_cli: bool,
     oplog: &OpLog,
@@ -867,6 +870,7 @@ fn fire_long_run(
     let run_id = run_id.to_string();
     let job_id = job_id.to_string();
     let oplog = oplog.clone();
+    let redactor = Arc::clone(redactor);
     Some(std::thread::spawn(move || {
         let Ok(db) = Db::open(&db_path) else { return };
         let me = liveness::current();
@@ -898,6 +902,7 @@ fn fire_long_run(
             oplog: &oplog,
             sender: &sender,
             host: cfg.host_name(),
+            redactor: redactor.as_ref(),
         };
         for id in ids {
             if let Ok(Some(row)) = db.get_delivery(id) {
@@ -921,6 +926,7 @@ fn deliver_run_events(
     events_to_send: &[Event],
     expected_from_cli: bool,
     interrupted: bool,
+    redactor: &Arc<Redactor>,
 ) {
     let now = now_ms();
     let mut own_rows: Vec<i64> = Vec::new();
@@ -966,6 +972,7 @@ fn deliver_run_events(
             oplog,
             sender,
             host: cfg.host_name(),
+            redactor: redactor.as_ref(),
         };
         for id in &own_rows {
             let remaining = overall_deadline.saturating_duration_since(Instant::now());
@@ -1024,6 +1031,7 @@ fn finish_start_failure(
     msg: &str,
     reporters_enabled: bool,
     db_ok: bool,
+    redactor: &Arc<Redactor>,
 ) -> i32 {
     eprintln!("uatu: error: {msg}");
     oplog.error(
@@ -1061,6 +1069,7 @@ fn finish_start_failure(
                 &[Event::Failure],
                 false,
                 false,
+                redactor,
             );
         }
     }

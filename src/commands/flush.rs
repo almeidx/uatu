@@ -40,6 +40,7 @@ pub fn cmd_flush(args: FlushArgs) -> i32 {
     let db = opened.db;
     let cfg = opened.config;
     let oplog = opened.oplog;
+    let redactor = opened.redactor;
     reconcile::reconcile(&db, &cfg, &oplog);
 
     match Sender::new() {
@@ -50,6 +51,7 @@ pub fn cmd_flush(args: FlushArgs) -> i32 {
                 oplog: &oplog,
                 sender: &sender,
                 host: cfg.host_name(),
+                redactor: &redactor,
             };
             let me = liveness::current();
             report::deliver_due(&ctx, &me, None);

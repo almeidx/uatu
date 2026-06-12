@@ -19,6 +19,7 @@ pub struct Opened {
     pub paths: Paths,
     pub db: Db,
     pub oplog: OpLog,
+    pub redactor: Arc<Redactor>,
 }
 
 /// Open config + state for inspection/maintenance commands. Unlike `run`,
@@ -49,6 +50,7 @@ pub fn open_for_inspection(
     )
     .map(Arc::new)
     .unwrap_or_else(|_| Arc::new(Redactor::empty()));
+    let redactor_clone = Arc::clone(&redactor);
     let oplog = OpLog::new(
         config::resolve_log_path(&cfg, &paths.state_dir),
         config::log_max_bytes(&cfg),
@@ -63,5 +65,6 @@ pub fn open_for_inspection(
         paths,
         db,
         oplog,
+        redactor: redactor_clone,
     })
 }

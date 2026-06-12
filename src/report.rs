@@ -14,6 +14,7 @@ use crate::db::{Db, DeliveryRow};
 use crate::events::{self, Event, MsgCtx, ReporterRef};
 use crate::liveness::Liveness;
 use crate::oplog::OpLog;
+use crate::redact::Redactor;
 use crate::util::now_ms;
 
 /// Per-reporter attempt budget (connect + send): 10 seconds.
@@ -145,7 +146,7 @@ impl Sender {
                     }
                 }
                 Err(e) => SendOutcome::Failed {
-                    error: format!("discord webhook request failed: {e}"),
+                    error: format!("discord webhook request failed: {}", e.without_url()),
                     retry_after: None,
                 },
             }
@@ -247,6 +248,7 @@ pub struct DeliverCtx<'a> {
     pub oplog: &'a OpLog,
     pub sender: &'a Sender,
     pub host: String,
+    pub redactor: &'a Redactor,
 }
 
 /// Attempt one claimed delivery row (state `sending`, owned by us) and write
@@ -290,6 +292,7 @@ pub fn deliver_row(ctx: &DeliverCtx, row: &DeliveryRow, budget: Duration) {
             let attempts = row.attempt_count + 1;
             let delay = next_attempt_delay(attempts, retry_after);
             let next = now_ms().saturating_add(crate::util::duration_ms_i64(delay));
+            let error = ctx.redactor.redact_str(&error);
             let _ = ctx.db.delivery_queued(row.id, next, &error);
             ctx.oplog.warn(
                 "delivery_failed",
@@ -304,6 +307,7 @@ pub fn deliver_row(ctx: &DeliverCtx, row: &DeliveryRow, budget: Duration) {
             );
         }
         Err(permanent) => {
+            let permanent = ctx.redactor.redact_str(&permanent);
             let _ = ctx.db.delivery_expired(row.id, &permanent);
             ctx.oplog.warn(
                 "delivery_expired",
