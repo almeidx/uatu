@@ -1,7 +1,9 @@
 //! `uatu prune`, `uatu init`, `uatu config validate`, `uatu cron example`,
 //! `uatu notify test` (SPEC §3).
 
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -160,6 +162,19 @@ const SAMPLE_CONFIG: &str = r#"# uatu configuration — https://github.com/almei
 # Run `uatu notify test` after configuring reporters.
 "#;
 
+fn write_config_0600(target: &std::path::Path) -> std::io::Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(target)?;
+    f.write_all(SAMPLE_CONFIG.as_bytes())?;
+    drop(f);
+    // Explicitly set mode so --force over an existing loose-mode file also tightens it.
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+}
+
 pub fn cmd_init(args: InitArgs) -> i32 {
     if args.stdout {
         print!("{SAMPLE_CONFIG}");
@@ -173,13 +188,14 @@ pub fn cmd_init(args: InitArgs) -> i32 {
         );
         return 1;
     }
+    // Config will hold webhook URLs / SMTP passwords: 0700 dir, 0600 file (SPEC §7 spirit).
     if let Some(parent) = target.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = crate::state::mkdir_0700_all(parent) {
             eprintln!("uatu: error: cannot create {}: {e}", parent.display());
             return 1;
         }
     }
-    match std::fs::write(&target, SAMPLE_CONFIG) {
+    match write_config_0600(&target) {
         Ok(()) => {
             println!("wrote {}", target.display());
             println!("next: edit it, then run `uatu config validate` and `uatu notify test`");

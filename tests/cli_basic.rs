@@ -394,6 +394,27 @@ fn init_writes_refuses_and_forces() {
 }
 
 #[test]
+fn init_writes_config_with_restrictive_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let dir = env.state_dir().join("cfg-home"); // any not-yet-existing dir
+    let target = dir.join("uatu").join("uatu.toml");
+    env.run_ok(&["init", "--path", target.to_str().unwrap()]);
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&target), 0o600, "config file must be 0600");
+    assert_eq!(
+        mode(target.parent().unwrap()),
+        0o700,
+        "created config dir must be 0700"
+    );
+
+    // --force over a loosened file repairs the mode.
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    env.run_ok(&["init", "--path", target.to_str().unwrap(), "--force"]);
+    assert_eq!(mode(&target), 0o600, "--force must restore 0600");
+}
+
+#[test]
 fn validate_strictness() {
     let env = TestEnv::new();
 
