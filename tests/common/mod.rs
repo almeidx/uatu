@@ -172,6 +172,8 @@ pub enum Behavior {
     Status(u16),
     /// Sleep before answering (to blow the send budget).
     Hang(Duration),
+    /// 429 with a raw (possibly malformed) Retry-After header value.
+    RateLimitedRaw(&'static str),
 }
 
 pub struct FakeDiscord {
@@ -263,6 +265,9 @@ fn handle_http(
             std::thread::sleep(d);
             "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
         }
+        Behavior::RateLimitedRaw(v) => format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {v}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        ),
     };
     let _ = stream.write_all(response.as_bytes());
 }

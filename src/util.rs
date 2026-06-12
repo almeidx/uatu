@@ -108,6 +108,13 @@ pub fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
+/// Saturating conversion of a `Duration` to whole milliseconds as `i64`
+/// (the storage representation for all timestamps/durations). Durations
+/// beyond i64::MAX ms clamp instead of wrapping.
+pub fn duration_ms_i64(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// RFC 3339 UTC rendering of stored epoch milliseconds (SPEC §11).
 pub fn rfc3339(ms: i64) -> String {
     match Timestamp::from_millisecond(ms) {
@@ -215,5 +222,11 @@ mod tests {
         let t = tail_chars("abcdefghij", 4);
         assert!(t.ends_with("ghij"));
         assert!(t.contains("truncated"));
+    }
+
+    #[test]
+    fn duration_ms_i64_normal_and_saturating() {
+        assert_eq!(duration_ms_i64(Duration::from_millis(1500)), 1500);
+        assert_eq!(duration_ms_i64(Duration::MAX), i64::MAX);
     }
 }

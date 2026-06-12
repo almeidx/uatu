@@ -390,6 +390,36 @@ fn http_429_retry_after_overrides_backoff() {
 }
 
 #[test]
+fn http_429_pathological_retry_after_neither_panics_nor_wraps() {
+    for raw in ["nan", "inf", "-5", "1e300", "soon"] {
+        let server = FakeDiscord::start(vec![Behavior::RateLimitedRaw(raw)]);
+        let env = TestEnv::new();
+        env.write_config(&discord_config(&server.url(), r#"["success"]"#));
+        // Invariant: the wrapper must still exit with the child's code (0),
+        // never a panic's 101.
+        let (code, _out, err) = env.run_code(&["run", "--name", "hostile", "--", "true"]);
+        assert_eq!(code, 0, "Retry-After {raw:?} altered the exit code: {err}");
+        let db = env.db();
+        let (state, next): (String, i64) = db
+            .conn
+            .query_row("SELECT state, next_attempt_ms FROM deliveries", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, "queued");
+        let now = uatu::util::now_ms();
+        assert!(
+            next > now - 60_000,
+            "{raw:?}: next_attempt_ms wrapped: {next}"
+        );
+        assert!(
+            next <= now + 25 * 3_600_000,
+            "{raw:?}: next_attempt_ms beyond the 1d clamp (+backoff): {next}"
+        );
+    }
+}
+
+#[test]
 fn delayed_retry_is_marked_with_both_timestamps() {
     let server = FakeDiscord::start(vec![Behavior::Status(500), Behavior::Ok]);
     let env = TestEnv::new();

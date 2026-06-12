@@ -53,6 +53,22 @@ pub fn backoff_base(attempts_failed: i64) -> Duration {
     }
 }
 
+/// Largest Retry-After we will honor (1 day). Discord sends seconds or
+/// fractional seconds; anything larger is a broken/hostile server and must
+/// not be able to schedule a delivery past the 7-day expiry horizon — and
+/// must never panic the wrapper (NaN/inf/negative all parse as f64).
+const MAX_RETRY_AFTER_SECS: f64 = 86_400.0;
+
+/// Total parse of a Retry-After header value: seconds (possibly fractional)
+/// → bounded Duration. Anything non-finite, negative, or unparseable → None.
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    let secs: f64 = value.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(secs.min(MAX_RETRY_AFTER_SECS)).ok()
+}
+
 /// Apply ±20% jitter, then honor Retry-After when it exceeds the scheduled
 /// backoff (SPEC §8, Discord rate limits).
 pub fn next_attempt_delay(attempts_failed: i64, retry_after: Option<Duration>) -> Duration {
@@ -116,8 +132,7 @@ impl Sender {
                             .headers()
                             .get("retry-after")
                             .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.trim().parse::<f64>().ok())
-                            .map(Duration::from_secs_f64);
+                            .and_then(parse_retry_after);
                         SendOutcome::Failed {
                             error: "discord webhook rate limited (429)".to_string(),
                             retry_after,
@@ -274,7 +289,7 @@ pub fn deliver_row(ctx: &DeliverCtx, row: &DeliveryRow, budget: Duration) {
         Ok(SendOutcome::Failed { error, retry_after }) => {
             let attempts = row.attempt_count + 1;
             let delay = next_attempt_delay(attempts, retry_after);
-            let next = now_ms() + delay.as_millis() as i64;
+            let next = now_ms().saturating_add(crate::util::duration_ms_i64(delay));
             let _ = ctx.db.delivery_queued(row.id, next, &error);
             ctx.oplog.warn(
                 "delivery_failed",
@@ -441,5 +456,26 @@ mod tests {
         let small = Duration::from_secs(1);
         let d = next_attempt_delay(4, Some(small));
         assert!(d >= Duration::from_secs(7200).mul_f64(0.8));
+    }
+
+    #[test]
+    fn parse_retry_after_cases() {
+        // Normal integer
+        assert_eq!(parse_retry_after("3600"), Some(Duration::from_secs(3600)));
+        // Fractional seconds
+        assert_eq!(parse_retry_after("1.5"), Some(Duration::from_millis(1500)));
+        // Pathological: non-finite
+        assert_eq!(parse_retry_after("nan"), None);
+        assert_eq!(parse_retry_after("inf"), None);
+        // Negative
+        assert_eq!(parse_retry_after("-5"), None);
+        // Unparseable
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        // Huge value: clamped to MAX_RETRY_AFTER_SECS (86400s)
+        assert_eq!(
+            parse_retry_after("1e300"),
+            Some(Duration::from_secs(86_400))
+        );
     }
 }

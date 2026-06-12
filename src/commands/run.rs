@@ -244,7 +244,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
         wrapper_start_ticks: me.start_ticks as i64,
         boot_id: me.boot_id.clone(),
         child_pid: None,
-        expected_duration_ms: eff.expected_duration.map(|d| d.as_millis() as i64),
+        expected_duration_ms: eff.expected_duration.map(crate::util::duration_ms_i64),
         long_run_fired: false,
         detached_children: false,
         stdout: CaptureMeta::default(),

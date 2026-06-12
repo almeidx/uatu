@@ -732,7 +732,7 @@ pub fn prune(
     let now = now_ms();
     let mut report = PruneReport::default();
 
-    let cutoff = now - max_age.as_millis() as i64;
+    let cutoff = now.saturating_sub(crate::util::duration_ms_i64(max_age));
     let mut aged_stored = 0u64;
     for run in db.runs_older_than(cutoff)? {
         let dir = run_dir(output_root, &run);
