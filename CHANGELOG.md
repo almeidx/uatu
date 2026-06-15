@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+
+## [0.1.1-alpha.2] - 2026-06-15
+
+- Switch release workflow to gh release create
+
 ## [0.1.1-alpha.1] - 2026-06-15
 
 - Split CI lint/test and move release publishing
