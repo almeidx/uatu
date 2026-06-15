@@ -161,14 +161,22 @@ jobs:
           find artifacts -type f -exec cp {} release-assets/ \;
           ls -la release-assets/
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ needs.version.outputs.tag }}
-          body_path: release_notes.txt
-          draft: false
-          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
-          files: release-assets/*
+      - name: Create GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
+
+          args=(--verify-tag --title "$TAG" --notes-file release_notes.txt)
+          if [[ "$VERSION" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "$TAG" "${assets[@]}" "${args[@]}"
