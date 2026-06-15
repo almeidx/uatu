@@ -275,8 +275,8 @@ cargo test          # unit + integration + reporter tests (Linux)
 cargo clippy --all-targets
 ```
 
-CI runs the test suite and builds the static musl release targets. Release
-tags publish `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
-binaries with SHA-256 checksums.
+CI runs the test suite and builds the static musl release targets. Merging a
+release PR publishes `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` binaries with SHA-256 checksums.
 
 License: Apache-2.0.
