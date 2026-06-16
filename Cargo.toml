@@ -9,25 +9,25 @@ keywords = ["cron", "monitoring", "observability", "cli"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-jiff = "0.2"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls-tls"] }
-libc = "0.2"
-rand = "0.9"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-signal-hook = "0.3"
-tokio = { version = "1", features = ["rt", "time"] }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+jiff = "0.2.28"
+lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
+libc = "0.2.186"
+rand = "0.10.1"
+regex = "1.12.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+signal-hook = "0.4.4"
+tokio = { version = "1.52.3", features = ["rt", "time"] }
 toml = "1.1.2"
-ulid = "1"
+ulid = "1.2.1"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [profile.release]
 lto = true

@@ -73,7 +73,7 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
 /// Apply ±20% jitter, then honor Retry-After when it exceeds the scheduled
 /// backoff (SPEC §8, Discord rate limits).
 pub fn next_attempt_delay(attempts_failed: i64, retry_after: Option<Duration>) -> Duration {
-    use rand::Rng;
+    use rand::RngExt;
     let base = backoff_base(attempts_failed);
     let jitter = rand::rng().random_range(0.8..=1.2);
     let scheduled = base.mul_f64(jitter);
