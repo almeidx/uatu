@@ -310,6 +310,8 @@ built-in generic secret detectors.
 
 ## Development
 
+Requires a stable Rust toolchain (Rust 1.96 or newer).
+
 ```sh
 cargo test          # unit + integration + reporter tests (Linux)
 cargo clippy --all-targets -- -D warnings

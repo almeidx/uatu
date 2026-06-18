@@ -2,6 +2,7 @@
 name = "uatu"
 version = "0.1.1-alpha.2"
 edition = "2021"
+rust-version = "1.96"
 license = "Apache-2.0"
 description = "Observe cron jobs without replacing cron: wrap commands, keep history, get alerts"
 repository = "https://github.com/almeidx/uatu"
