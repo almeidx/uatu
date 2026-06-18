@@ -1,5 +1,5 @@
-# CI (SPEC §13, §14): Linux-only checks and static musl release-target
-# builds. Release publishing is handled by release-publish.yml.
+# CI: Linux-only checks and static musl release-target builds. Release
+# publishing is handled by release-publish.yml.
 
 name: CI
 
@@ -55,7 +55,7 @@ jobs:
           shared-key: linux-x64
           cache-on-failure: true
 
-      - name: Unit + integration + reporter tests
+      - name: Unit + integration tests
         run: cargo test
 
   musl-build:

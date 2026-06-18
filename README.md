@@ -312,7 +312,8 @@ built-in generic secret detectors.
 
 ```sh
 cargo test          # unit + integration + reporter tests (Linux)
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
 CI runs the test suite and builds the static musl release targets. Merging a

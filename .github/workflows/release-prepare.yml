@@ -12,11 +12,16 @@ on:
           - patch
           - minor
           - major
-      prerelease:
-        description: Pre-release identifier, such as alpha.1, beta.1, or rc.1. Leave empty for a stable release.
-        required: false
-        default: ""
-        type: string
+          - prerelease
+      prerelease_tag:
+        description: Pre-release tag to use when bump is prerelease.
+        required: true
+        default: alpha
+        type: choice
+        options:
+          - alpha
+          - beta
+          - rc
 
 concurrency:
   group: release-prepare
@@ -55,7 +60,7 @@ jobs:
         run: |
           CURRENT="${{ steps.current.outputs.version }}"
           BUMP="${{ inputs.bump }}"
-          PRERELEASE="${{ inputs.prerelease }}"
+          PRERELEASE_TAG="${{ inputs.prerelease_tag }}"
 
           CURRENT_BASE="${CURRENT%%-*}"
           CURRENT_PRERELEASE="${CURRENT#*-}"
@@ -65,27 +70,43 @@ jobs:
 
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_BASE"
 
-          if [ -z "$PRERELEASE" ] || [ -z "$CURRENT_PRERELEASE" ]; then
-            case "$BUMP" in
-              major)
-                MAJOR=$((MAJOR + 1))
-                MINOR=0
-                PATCH=0
-                ;;
-              minor)
-                MINOR=$((MINOR + 1))
-                PATCH=0
-                ;;
-              patch)
+          case "$BUMP" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+              ;;
+            prerelease)
+              if [ -z "$CURRENT_PRERELEASE" ]; then
                 PATCH=$((PATCH + 1))
-                ;;
-            esac
-          fi
+                NEXT_NUMBER=1
+              else
+                CURRENT_TAG="${CURRENT_PRERELEASE%%.*}"
+                CURRENT_NUMBER="${CURRENT_PRERELEASE#*.}"
+                if [ "$CURRENT_NUMBER" = "$CURRENT_PRERELEASE" ]; then
+                  CURRENT_TAG=$(printf '%s' "$CURRENT_PRERELEASE" | sed -E 's/[0-9]+$//')
+                  CURRENT_NUMBER=$(printf '%s' "$CURRENT_PRERELEASE" | sed -E 's/^.*[^0-9]([0-9]+)$/\1/')
+                fi
 
-          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-          if [ -n "$PRERELEASE" ]; then
-            NEW_VERSION="$NEW_VERSION-$PRERELEASE"
-          fi
+                if [ "$CURRENT_TAG" = "$PRERELEASE_TAG" ] && printf '%s' "$CURRENT_NUMBER" | grep -Eq '^[0-9]+$'; then
+                  NEXT_NUMBER=$((CURRENT_NUMBER + 1))
+                else
+                  NEXT_NUMBER=1
+                fi
+              fi
+              NEW_VERSION="$MAJOR.$MINOR.$PATCH-$PRERELEASE_TAG.$NEXT_NUMBER"
+              ;;
+          esac
 
           TAG="v$NEW_VERSION"
           BRANCH="release/$TAG"

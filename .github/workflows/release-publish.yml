@@ -163,7 +163,7 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -171,6 +171,11 @@ jobs:
           assets=(release-assets/*)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
             exit 1
           fi
 
