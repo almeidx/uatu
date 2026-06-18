@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use uatu::commands::configure::{cmd_configure, ConfigureArgs};
 use uatu::commands::flush::{cmd_flush, FlushArgs};
 use uatu::commands::inspect::{
     cmd_history, cmd_show, cmd_status, HistoryArgs, ShowArgs, StatusArgs,
@@ -69,6 +70,8 @@ enum Cmd {
 enum ConfigCmd {
     /// Parse and validate the config file (strict: unknown keys are errors)
     Validate(ValidateCli),
+    /// Build or update the config file interactively
+    Wizard(WizardCli),
 }
 
 #[derive(Subcommand)]
@@ -226,10 +229,20 @@ struct InitCli {
     /// Overwrite an existing file
     #[arg(long)]
     force: bool,
+    /// Configure interactively instead of writing the commented template
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[derive(Args)]
 struct ValidateCli {
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct WizardCli {
+    /// Config file to create or update (default: standard config location)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 }
@@ -300,14 +313,23 @@ fn main() -> ExitCode {
             data_dir: a.common.data_dir,
             dry_run: a.dry_run,
         }),
-        Cmd::Init(a) => cmd_init(InitArgs {
-            path: a.path,
-            stdout: a.stdout,
-            force: a.force,
-        }),
+        Cmd::Init(a) => {
+            if a.interactive {
+                cmd_configure(ConfigureArgs { target: a.path })
+            } else {
+                cmd_init(InitArgs {
+                    path: a.path,
+                    stdout: a.stdout,
+                    force: a.force,
+                })
+            }
+        }
         Cmd::Config {
             cmd: ConfigCmd::Validate(a),
         } => cmd_validate(ValidateArgs { config: a.config }),
+        Cmd::Config {
+            cmd: ConfigCmd::Wizard(a),
+        } => cmd_configure(ConfigureArgs { target: a.config }),
         Cmd::Cron {
             cmd: CronCmd::Example(a),
         } => cmd_cron_example(CronExampleArgs {

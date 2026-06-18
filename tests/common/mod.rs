@@ -88,6 +88,53 @@ impl TestEnv {
         )
     }
 
+    /// Build a uatu Command with the isolated env but WITHOUT the automatic
+    /// `--data-dir`/`--config` insertion `cmd` does. Tests that need to control
+    /// those flags exactly (e.g. the interactive wizard) use this.
+    pub fn cmd_raw(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(uatu_bin());
+        c.env("XDG_CONFIG_HOME", self.dir.path().join("xdg-config"));
+        c.env("XDG_STATE_HOME", self.dir.path().join("xdg-state"));
+        c.env_remove("SHELL");
+        c.env_remove("UATU_PER_REPORTER_BUDGET_MS");
+        c.env_remove("UATU_OVERALL_BUDGET_MS");
+        c.args(args);
+        c
+    }
+
+    /// The wizard's default target under this sandbox's isolated XDG config.
+    pub fn xdg_config_target(&self) -> PathBuf {
+        self.dir
+            .path()
+            .join("xdg-config")
+            .join("uatu")
+            .join("uatu.toml")
+    }
+
+    /// Run a command feeding `input` on stdin to EOF, capturing everything.
+    /// stdin is written from a separate thread so the child's stdout/stderr
+    /// are drained concurrently — a single blocking write would deadlock if the
+    /// child's output exceeded the pipe buffer before consuming all input.
+    pub fn run_input(&self, mut cmd: Command, input: &str) -> (i32, String, String) {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn uatu");
+        let mut stdin = child.stdin.take().expect("stdin pipe");
+        let bytes = input.as_bytes().to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+            // Dropping stdin here closes the pipe, signalling EOF to the child.
+        });
+        let out = child.wait_with_output().expect("wait uatu");
+        let _ = writer.join();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     /// Open the test sandbox's database directly via the uatu library.
     pub fn db(&self) -> uatu::db::Db {
         uatu::db::Db::open(&self.state_dir().join("uatu.db")).expect("open test db")

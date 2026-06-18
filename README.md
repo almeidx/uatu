@@ -45,6 +45,16 @@ Linux.
 
 ## Quick start
 
+The fastest path is the interactive wizard — it asks a short series of
+questions (every one has a default you can accept by pressing Enter), wires up
+reporters, and can fire a test notification at the end:
+
+```sh
+uatu config wizard         # or: uatu init --interactive
+```
+
+Prefer to hand-edit? Start from the commented template instead:
+
 ```sh
 uatu init                  # writes a starter config (~/.config/uatu/uatu.toml)
 $EDITOR ~/.config/uatu/uatu.toml
@@ -122,6 +132,17 @@ change the exit code cron sees.
 One TOML file: `--config PATH`, else `$XDG_CONFIG_HOME/uatu/uatu.toml`
 (`~/.config/uatu/uatu.toml`), else `/etc/uatu/uatu.toml`. Run
 `uatu init --stdout` to see a fully commented sample.
+
+`uatu config wizard` (alias `uatu init --interactive`) builds or updates this
+file interactively: a menu lets you pick what to configure — reporters,
+notification routing, per-job overrides, global/capture settings, retention and
+redaction — and every prompt offers a default. On a terminal you navigate menus
+with the **arrow keys or `j`/`k`**, Enter to choose, Space to toggle multi-selects;
+**Esc cancels the current section and steps back to the menu**, and Ctrl-C quits
+without saving. When input is piped or redirected it falls back to typing the
+option number, so it stays scriptable. It writes the file `0600`, keeps a `.bak`
+of any previous version, and can send a test notification through the reporters
+you just defined.
 
 Setting precedence: **CLI flag > job config > global config > built-in
 default**. `--env` entries merge over job-config `env` key-by-key.

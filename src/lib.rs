@@ -12,6 +12,7 @@ pub mod identity;
 pub mod liveness;
 pub mod lock;
 pub mod oplog;
+pub mod prompt;
 pub mod reconcile;
 pub mod redact;
 pub mod report;
