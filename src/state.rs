@@ -41,10 +41,11 @@ pub fn mkdir_0700_all(path: &Path) -> std::io::Result<()> {
 }
 
 /// Write `bytes` to `target` with 0600 permissions, truncating any existing
-/// file. Permissions are tightened through the open file handle (not by path),
-/// which avoids a TOCTOU window and still repairs a pre-existing loose-mode
-/// file — `create().mode()` only applies on creation (config files can hold
-/// webhook URLs / SMTP passwords).
+/// file. Config files can hold webhook URLs / SMTP passwords, so permissions
+/// are tightened through the open file handle (avoiding a path-based TOCTOU)
+/// *before* any bytes are written: the file is already truncated to empty at
+/// this point, so a pre-existing loose-mode file (`create().mode()` only
+/// applies on creation) never briefly holds world-readable secrets.
 pub fn write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = OpenOptions::new()
         .create(true)
@@ -52,8 +53,8 @@ pub fn write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(target)?;
-    f.write_all(bytes)?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
 }
 
 /// Free bytes available to unprivileged users on the filesystem holding

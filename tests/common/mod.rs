@@ -127,7 +127,7 @@ impl TestEnv {
             // Dropping stdin here closes the pipe, signalling EOF to the child.
         });
         let out = child.wait_with_output().expect("wait uatu");
-        let _ = writer.join();
+        writer.join().expect("stdin writer thread");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
