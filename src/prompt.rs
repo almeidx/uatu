@@ -362,7 +362,11 @@ fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue; // EINTR (e.g. SIGWINCH) — retry rather than fail the UI
+            }
+            return Err(e);
         }
         if n == 0 {
             break;
@@ -371,6 +375,22 @@ fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Wait up to `timeout_ms` for `fd` to become readable. Used to tell a lone ESC
+/// apart from the start of an arrow-key sequence split across reads.
+fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    r > 0 && (pfd.revents & libc::POLLIN) != 0
+}
+
+/// How long to wait for the rest of an escape sequence before deciding a lone
+/// ESC byte really means the Esc key.
+const ESC_TIMEOUT_MS: i32 = 50;
 
 pub struct TermUi {
     in_fd: RawFd,
@@ -411,19 +431,39 @@ impl TermUi {
         write_all_fd(self.out_fd, s.as_bytes())
     }
 
+    /// Blocking read into a temp buffer, retrying on EINTR.
+    fn read_some(&self, tmp: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let n =
+                unsafe { libc::read(self.in_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue; // EINTR (e.g. SIGWINCH) — retry rather than abort the UI
+                }
+                return Err(e);
+            }
+            return Ok(n as usize);
+        }
+    }
+
     /// Read one key (raw mode), refilling the buffer only when it is empty.
     fn read_key(&mut self) -> io::Result<Key> {
         if self.inbuf.is_empty() {
             let mut tmp = [0u8; 16];
-            let n =
-                unsafe { libc::read(self.in_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            let n = self.read_some(&mut tmp)?;
             if n == 0 {
                 return Ok(Key::Eof);
             }
-            self.inbuf.extend_from_slice(&tmp[..n as usize]);
+            self.inbuf.extend_from_slice(&tmp[..n]);
+        }
+        // A lone ESC may be the first byte of an arrow-key sequence split across
+        // reads. Briefly wait for the rest before treating it as the Esc key, so
+        // navigation is not mistaken for cancel on slow/loaded terminals.
+        if self.inbuf == [0x1b] && poll_readable(self.in_fd, ESC_TIMEOUT_MS) {
+            let mut tmp = [0u8; 16];
+            let n = self.read_some(&mut tmp)?;
+            self.inbuf.extend_from_slice(&tmp[..n]);
         }
         let (key, consumed) = decode_key(&self.inbuf);
         self.inbuf.drain(..consumed.min(self.inbuf.len()));
@@ -901,6 +941,41 @@ mod tests {
         // Esc cancels a text field too.
         let text_cancel = drive_term(b"hi\x1b", |ui| ui.text("name", None));
         assert!(matches!(text_cancel, Err(PromptError::Cancel)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn term_ui_reassembles_split_escape_sequence() {
+        // ESC arrives alone, then the rest of the arrow sequence within the
+        // timeout: it must navigate (Down -> index 1), not be read as Cancel.
+        let (master, slave) = open_pty();
+        set_raw(slave);
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            while unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
+                > 0
+            {}
+        });
+        let handle = std::thread::spawn(move || {
+            TermUi::with_fds(slave, slave).select("pick", &["a", "b", "c"], 0)
+        });
+        let w = |bytes: &[u8]| {
+            let n =
+                unsafe { libc::write(master, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        };
+        w(b"\x1b");
+        std::thread::sleep(std::time::Duration::from_millis(10)); // < ESC_TIMEOUT_MS
+        w(b"[B\n");
+        let res = handle.join().expect("ui thread");
+        unsafe { libc::close(slave) };
+        drain.join().expect("drain");
+        unsafe { libc::close(master) };
+        assert_eq!(
+            res.expect("select"),
+            1,
+            "split arrow must navigate, not cancel"
+        );
     }
 
     #[cfg(unix)]

@@ -230,7 +230,7 @@ struct InitCli {
     #[arg(long)]
     force: bool,
     /// Configure interactively instead of writing the commented template
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["stdout", "force"])]
     interactive: bool,
 }
 

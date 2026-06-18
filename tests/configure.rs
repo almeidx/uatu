@@ -65,6 +65,19 @@ fn init_interactive_writes_minimal_valid_config() {
 }
 
 #[test]
+fn init_interactive_conflicts_with_template_flags() {
+    let env = TestEnv::new();
+    for flag in ["--stdout", "--force"] {
+        let (code, _, err) = env.run_input(env.cmd_raw(&["init", "--interactive", flag]), "");
+        assert_eq!(code, 2, "`init --interactive {flag}` must be a usage error");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected a clap conflict error, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn wizard_preserves_existing_config_and_writes_backup() {
     let env = TestEnv::new();
     let target = env.dir.path().join("existing.toml");

@@ -300,11 +300,12 @@ fn add_smtp<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
         .map(|n| n.to_string())
         .unwrap_or_else(|| "587".to_string());
     let port_str = p.text_validated("SMTP port", Some(&port_default), |a| {
-        a.parse::<u16>()
-            .map(|_| ())
-            .map_err(|_| "must be a port number (1-65535)".into())
+        match a.parse::<u16>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err("must be a port number (1-65535)".into()),
+        }
     })?;
-    let port = port_str.parse::<u16>().ok();
+    let port = port_str.parse::<u16>().ok().filter(|&n| n >= 1);
     let tls_opts = ["starttls", "smtps", "none"];
     let tls_default = existing
         .as_ref()
