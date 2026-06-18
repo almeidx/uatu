@@ -38,15 +38,26 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
             use_cross: false
+            install_musl: true
+            verify_static: true
           - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
             use_cross: true
+            install_musl: false
+            verify_static: false
+          - target: aarch64-apple-darwin
+            os: macos-15
+            use_cross: false
+            install_musl: false
+            verify_static: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -64,14 +75,14 @@ jobs:
           cache-on-failure: true
 
       - name: Install musl tools
-        if: ${{ !matrix.use_cross }}
+        if: ${{ matrix.install_musl }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cross
         if: ${{ matrix.use_cross }}
         run: cargo install cross --locked
 
-      - name: Build (release, fully static)
+      - name: Build release binary
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
@@ -80,7 +91,7 @@ jobs:
           fi
 
       - name: Verify static linkage
-        if: ${{ !matrix.use_cross }}
+        if: ${{ matrix.verify_static }}
         run: |
           file target/${{ matrix.target }}/release/uatu
           (ldd target/${{ matrix.target }}/release/uatu 2>&1 || true) | grep -Eq 'not a dynamic|statically linked'
@@ -92,7 +103,11 @@ jobs:
           archive="uatu-${VERSION}-${{ matrix.target }}.tar.gz"
           tar -C target/${{ matrix.target }}/release -czf "dist/$archive" uatu
           cd dist
-          sha256sum "$archive" > "$archive.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
