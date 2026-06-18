@@ -29,15 +29,25 @@ When something in uatu breaks, the job still runs and uatu degrades.
 
 ## Install
 
+Preferred:
+
+```sh
+brew install almeidx/tap/uatu
+```
+
+This installs the prebuilt GitHub Release artifact for Apple Silicon macOS or
+Linux (`x86_64` / `aarch64`).
+
 From crates.io:
 
 ```sh
 cargo install uatu
 ```
 
-Or download a **fully static musl binary** (`x86_64` / `aarch64`) from GitHub
-Releases — one binary that runs on any Linux of the last decade. Verify with
-the published SHA-256 checksums.
+Or download a release archive directly from
+[GitHub Releases](https://github.com/almeidx/uatu/releases). Linux archives are
+fully static musl binaries: one binary that runs on any Linux of the last
+decade. Verify with the published SHA-256 checksums.
 
 Linux is the supported production platform. macOS builds may work for
 development, but cron/process semantics are only guaranteed (and CI-tested) on
