@@ -56,6 +56,7 @@ pub fn reconcile(db: &Db, cfg: &Config, oplog: &OpLog) -> ReconcileOutcome {
                     None,
                 );
             }
+            crate::report::queue_digest_for_run(db, cfg, &run.run_id, &run.job_id, now);
             outcome.stale_run_ids.push(run.run_id);
         }
     }

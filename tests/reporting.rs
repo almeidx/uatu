@@ -201,6 +201,81 @@ fn recovery_event_after_failure() {
 }
 
 #[test]
+fn digest_batches_totals_and_keeps_failures_immediate() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[global]
+host_name = "test-host-01"
+[notify]
+events = ["failure"]
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "digest-job", "--", "true"]);
+    env.run_ok(&["run", "--name", "digest-job", "--", "true"]);
+    assert_eq!(server.hit_count(), 0, "successes are queued for digest");
+
+    let db = env.db();
+    let queued_digest_rows: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE event='digest' AND digest_period='hourly' AND state='queued'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued_digest_rows, 2);
+    drop(db);
+
+    let (code, _, _) = env.run_code(&["run", "--name", "digest-job", "--", "false"]);
+    assert_eq!(code, 1);
+    assert_eq!(server.hit_count(), 1, "failure remains immediate");
+    assert_eq!(server.embed(0)["title"], "FAILURE: digest-job");
+
+    {
+        let db = env.db();
+        let due = uatu::util::now_ms() - 1000;
+        let start = due - 3_600_000;
+        db.conn
+            .execute(
+                &format!(
+                    "UPDATE deliveries SET next_attempt_ms={due}, digest_start_ms={start}, digest_end_ms={due} WHERE event='digest'"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 2, "one digest for three runs");
+    let digest = server.embed(1);
+    assert_eq!(digest["title"], "DIGEST: digest-job");
+    let desc = digest["description"].as_str().unwrap();
+    assert!(desc.contains("total runs: 3"), "{desc}");
+    assert!(desc.contains("success=2"), "{desc}");
+    assert!(desc.contains("failure=1"), "{desc}");
+    assert!(desc.contains("period: hourly"), "{desc}");
+
+    let db = env.db();
+    let delivered_digest_rows: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE event='digest' AND digest_period='hourly' AND state='delivered'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_digest_rows, 3);
+}
+
+#[test]
 fn smtp_email_subject_and_body() {
     let smtp = FakeSmtp::start();
     let env = TestEnv::new();

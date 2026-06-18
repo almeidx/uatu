@@ -459,11 +459,12 @@ pub fn cmd_run(args: RunArgs) -> i32 {
         classify_exit(&exit_status, timeout_fired);
 
     // ----- final record -----
+    let end_ms = now_ms();
     if db_ok {
         if let Err(e) = db.finish_run(
             &run_id,
             status_str,
-            now_ms(),
+            end_ms,
             exit_code,
             signal_no,
             timeout_fired,
@@ -506,6 +507,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             "failure" | "timeout" => events_to_send.push(Event::Failure),
             _ => {}
         }
+        report::queue_digest_for_run(&db, &cfg, &run_id, &job_id, end_ms);
         deliver_run_events(
             &db,
             &cfg,
@@ -1043,10 +1045,11 @@ fn finish_start_failure(
         ],
     );
     if db_ok {
+        let end_ms = now_ms();
         let _ = db.finish_run(
             run_id,
             "start_failed",
-            now_ms(),
+            end_ms,
             Some(code as i64),
             None,
             false,
@@ -1057,6 +1060,7 @@ fn finish_start_failure(
             &CaptureMeta::default(),
         );
         if reporters_enabled {
+            report::queue_digest_for_run(db, cfg, run_id, job_id, end_ms);
             // start_failed reports as a failure event with start detail (SPEC §8).
             deliver_run_events(
                 db,

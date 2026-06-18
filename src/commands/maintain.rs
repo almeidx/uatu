@@ -130,14 +130,15 @@ const SAMPLE_CONFIG: &str = r#"# uatu configuration — https://github.com/almei
 # regex = ['''password=[^[:space:]]+''']
 
 [notify]
-# events = ["success", "failure"]     # valid: success, failure, recovery, stale, long_run
+# events = ["success", "failure"]     # valid: success, failure, recovery, stale, long_run, digest
 # reporters = ["discord.default", "smtp.ops"]
 # failure_output = true               # include redacted output tails on failure
+# digest = "off"                      # off | hourly | daily | weekly | monthly
 
 # [reporters.discord.default]
 # webhook_url = "https://discord.com/api/webhooks/..."
 # max_message_chars = 3500
-# events = ["success", "failure", "recovery", "stale", "long_run"]
+# events = ["success", "failure", "recovery", "stale", "long_run", "digest"]
 
 # [reporters.smtp.ops]
 # host = "smtp.example.com"
@@ -157,6 +158,7 @@ const SAMPLE_CONFIG: &str = r#"# uatu configuration — https://github.com/almei
 # schedule_label = "nightly at 02:00" # display only
 # reporters = ["discord.default"]
 # events = ["failure", "recovery"]    # the quiet profile for frequent jobs
+# digest = "daily"                    # periodic total/status summary for this job
 
 # Run `uatu config validate` after every edit.
 # Run `uatu notify test` after configuring reporters.
@@ -381,7 +383,7 @@ fn validate_events(list: &[String], where_: &str, errors: &mut Vec<String>) {
     for e in list {
         if Event::parse(e).is_none() {
             errors.push(format!(
-                "{where_}: unknown event {e:?} (valid: success, failure, recovery, stale, long_run)"
+                "{where_}: unknown event {e:?} (valid: success, failure, recovery, stale, long_run, digest)"
             ));
         }
     }

@@ -3,14 +3,15 @@
 //! handling, 7-day expiry, and the shared per-row delivery driver used by
 //! `run` (own events + opportunistic flush) and `flush`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-use crate::config::{Config, SmtpCfg, SmtpTls};
-use crate::db::{Db, DeliveryRow};
+use crate::config::{self, Config, DigestPeriod, SmtpCfg, SmtpTls};
+use crate::db::{Db, DeliveryDigest, DeliveryRow};
 use crate::events::{self, Event, MsgCtx, ReporterRef};
 use crate::liveness::Liveness;
 use crate::oplog::OpLog;
@@ -41,6 +42,60 @@ pub const RETRY_MAX_AGE_MS: i64 = 7 * 86_400_000;
 
 /// A delivery counts as "delayed" when retried or sent well after the event.
 pub const DELAYED_THRESHOLD_MS: i64 = 90_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DigestKey {
+    job_id: String,
+    event: String,
+    reporter: String,
+    period: String,
+    start_ms: i64,
+    end_ms: i64,
+}
+
+impl DigestKey {
+    fn from_row(row: &DeliveryRow) -> Option<DigestKey> {
+        Some(DigestKey {
+            job_id: row.job_id.clone(),
+            event: row.event.clone(),
+            reporter: row.reporter.clone(),
+            period: row.digest_period.clone()?,
+            start_ms: row.digest_start_ms?,
+            end_ms: row.digest_end_ms?,
+        })
+    }
+}
+
+/// Queue this terminal run for a later per-job digest. The digest is
+/// independent of the job-effective alert events; reporter-level filters may
+/// opt out by omitting `digest`.
+pub fn queue_digest_for_run(db: &Db, cfg: &Config, run_id: &str, job_id: &str, event_ms: i64) {
+    let period = config::digest_period(cfg, job_id);
+    if period == DigestPeriod::Off {
+        return;
+    }
+    let Some((start_ms, end_ms)) = period.window_for(event_ms) else {
+        return;
+    };
+    let digest = DeliveryDigest {
+        period: period.as_str().to_string(),
+        start_ms,
+        end_ms,
+    };
+    for reporter in events::reporters_for_digest(cfg, job_id) {
+        let _ = db.insert_digest_delivery(
+            run_id,
+            job_id,
+            Event::Digest.as_str(),
+            &reporter,
+            "queued",
+            event_ms,
+            Some(end_ms),
+            None,
+            &digest,
+        );
+    }
+}
 
 /// Backoff schedule: 1m, 5m, 25m, 2h, then every 6h (SPEC §8).
 /// `attempts_failed` is the total failures so far (≥1).
@@ -318,6 +373,96 @@ pub fn deliver_row(ctx: &DeliverCtx, row: &DeliveryRow, budget: Duration) {
     }
 }
 
+fn deliver_digest_rows(ctx: &DeliverCtx, rows: &[DeliveryRow], budget: Duration) {
+    let Some(first) = rows.first() else {
+        return;
+    };
+    let now = now_ms();
+    ctx.oplog.info(
+        "delivery_attempted",
+        &format!(
+            "attempting {} digest via {}",
+            first.digest_period.as_deref().unwrap_or("periodic"),
+            first.reporter
+        ),
+        &[
+            ("job_id", serde_json::json!(first.job_id)),
+            ("reporter", serde_json::json!(first.reporter)),
+            ("digest_count", serde_json::json!(rows.len())),
+        ],
+    );
+
+    let expiry_base = first.digest_end_ms.unwrap_or(first.created_ms);
+    if now - expiry_base > RETRY_MAX_AGE_MS {
+        for row in rows {
+            let _ = ctx
+                .db
+                .delivery_expired(row.id, "retry max age (7d) exceeded");
+        }
+        ctx.oplog.warn(
+            "delivery_expired",
+            &format!(
+                "{} digest via {} expired after 7d",
+                first.event, first.reporter
+            ),
+            &[("job_id", serde_json::json!(first.job_id))],
+        );
+        return;
+    }
+
+    let outcome = attempt_send_digest(ctx, rows, budget);
+    match outcome {
+        Ok(SendOutcome::Delivered) => {
+            let delivered = now_ms();
+            for row in rows {
+                let _ = ctx.db.delivery_delivered(row.id, delivered);
+            }
+            ctx.oplog.info(
+                "delivery_succeeded",
+                &format!("{} digest via {} delivered", first.event, first.reporter),
+                &[
+                    ("job_id", serde_json::json!(first.job_id)),
+                    ("digest_count", serde_json::json!(rows.len())),
+                ],
+            );
+        }
+        Ok(SendOutcome::Failed { error, retry_after }) => {
+            let attempts = rows.iter().map(|r| r.attempt_count).max().unwrap_or(0) + 1;
+            let delay = next_attempt_delay(attempts, retry_after);
+            let next = now_ms().saturating_add(crate::util::duration_ms_i64(delay));
+            let error = ctx.redactor.redact_str(&error);
+            for row in rows {
+                let _ = ctx.db.delivery_queued(row.id, next, &error);
+            }
+            ctx.oplog.warn(
+                "delivery_failed",
+                &format!(
+                    "{} digest via {} failed: {error}",
+                    first.event, first.reporter
+                ),
+                &[
+                    ("job_id", serde_json::json!(first.job_id)),
+                    (
+                        "next_attempt_at",
+                        serde_json::json!(crate::util::rfc3339(next)),
+                    ),
+                ],
+            );
+        }
+        Err(permanent) => {
+            let permanent = ctx.redactor.redact_str(&permanent);
+            for row in rows {
+                let _ = ctx.db.delivery_expired(row.id, &permanent);
+            }
+            ctx.oplog.warn(
+                "delivery_expired",
+                &format!("{} digest via {}: {permanent}", first.event, first.reporter),
+                &[("job_id", serde_json::json!(first.job_id))],
+            );
+        }
+    }
+}
+
 /// Err(_) means permanently undeliverable (no such reporter/run/event).
 fn attempt_send(
     ctx: &DeliverCtx,
@@ -389,6 +534,77 @@ fn attempt_send(
     })
 }
 
+/// Err(_) means permanently undeliverable (no such reporter/digest/run).
+fn attempt_send_digest(
+    ctx: &DeliverCtx,
+    rows: &[DeliveryRow],
+    budget: Duration,
+) -> Result<SendOutcome, String> {
+    let first = rows
+        .first()
+        .ok_or_else(|| "empty digest delivery group".to_string())?;
+    if first.event != Event::Digest.as_str() {
+        return Err(format!(
+            "digest delivery does not support event {:?}",
+            first.event
+        ));
+    }
+    let (Some(period), Some(start_ms), Some(end_ms)) = (
+        first.digest_period.as_deref(),
+        first.digest_start_ms,
+        first.digest_end_ms,
+    ) else {
+        return Err("digest delivery row is missing digest metadata".to_string());
+    };
+    let Some(reporter) = events::lookup_reporter(ctx.cfg, &first.reporter) else {
+        return Err(format!("reporter {:?} is not configured", first.reporter));
+    };
+
+    let mut runs = Vec::new();
+    for row in rows {
+        if let Some(run) = ctx.db.get_run(&row.run_id).ok().flatten() {
+            if run.status != "active" {
+                runs.push(run);
+            }
+        }
+    }
+    if runs.is_empty() {
+        return Err("digest contains no existing terminal run rows".to_string());
+    }
+    runs.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+
+    let now = now_ms();
+    let delayed = if rows.iter().any(|r| r.attempt_count > 0) {
+        Some((end_ms, now))
+    } else {
+        None
+    };
+    let dctx = events::DigestMsgCtx {
+        job_id: &first.job_id,
+        period,
+        window_start_ms: start_ms,
+        window_end_ms: end_ms,
+        host: &ctx.host,
+        runs: &runs,
+        delayed,
+    };
+
+    Ok(match reporter {
+        ReporterRef::Discord(d) => {
+            let payload = events::discord_digest_payload(&dctx, d.max_message_chars);
+            ctx.sender.send_discord(&d.webhook_url, &payload, budget)
+        }
+        ReporterRef::Smtp(s) => {
+            let (subject, body) = events::digest_email_message(&dctx, s.max_message_chars);
+            ctx.sender.send_smtp(s, &subject, &body, budget)
+        }
+    })
+}
+
 /// Claim and deliver all due queued rows (used by `flush` and `run`'s
 /// opportunistic flush). `deadline` bounds total time (None = unbounded).
 pub fn deliver_due(ctx: &DeliverCtx, me: &Liveness, deadline: Option<std::time::Instant>) {
@@ -396,20 +612,43 @@ pub fn deliver_due(ctx: &DeliverCtx, me: &Liveness, deadline: Option<std::time::
         Ok(d) => d,
         Err(_) => return,
     };
+    let mut digest_groups_seen = BTreeSet::new();
     for row in due {
         if let Some(d) = deadline {
             if std::time::Instant::now() >= d {
                 return; // remaining rows stay queued and due
             }
         }
+        if let Some(key) = DigestKey::from_row(&row) {
+            if !digest_groups_seen.insert(key) {
+                continue;
+            }
+            let claimed = match ctx.db.claim_digest_group(&row, me, now_ms()) {
+                Ok(rows) => rows,
+                Err(_) => continue,
+            };
+            if claimed.is_empty() {
+                continue;
+            }
+            let budget = match deadline {
+                Some(d) => report_budget_remaining(d),
+                None => per_reporter_budget(),
+            };
+            if budget.is_zero() {
+                for claimed_row in &claimed {
+                    let _ = ctx.db.delivery_requeue(claimed_row.id, now_ms());
+                }
+                return;
+            }
+            deliver_digest_rows(ctx, &claimed, budget);
+            continue;
+        }
         match ctx.db.claim_delivery(row.id, me) {
             Ok(true) => {}
             _ => continue, // someone else took it
         }
         let budget = match deadline {
-            Some(d) => {
-                per_reporter_budget().min(d.saturating_duration_since(std::time::Instant::now()))
-            }
+            Some(d) => report_budget_remaining(d),
             None => per_reporter_budget(),
         };
         if budget.is_zero() {
@@ -421,6 +660,10 @@ pub fn deliver_due(ctx: &DeliverCtx, me: &Liveness, deadline: Option<std::time::
             deliver_row(ctx, &claimed, budget);
         }
     }
+}
+
+fn report_budget_remaining(deadline: std::time::Instant) -> Duration {
+    per_reporter_budget().min(deadline.saturating_duration_since(std::time::Instant::now()))
 }
 
 #[cfg(test)]

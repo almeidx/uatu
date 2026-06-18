@@ -134,15 +134,17 @@ observed, and warns when `expected_duration` exceeds `timeout`.
 
 ### Events and reporters
 
-Events: `success`, `failure`, `recovery`, `stale`, `long_run`. Default:
-`["success", "failure"]`. Per-reporter `events` filters intersect with the
-job-effective set — "Discord gets everything, email only failures" needs no
-routing matrix:
+Events: `success`, `failure`, `recovery`, `stale`, `long_run`, `digest`.
+Default: `["success", "failure"]`. Per-reporter `events` filters intersect
+with the job-effective set — "Discord gets everything, email only failures"
+needs no routing matrix. `digest` is controlled by the `digest` period setting
+below and can be included in per-reporter filters:
 
 ```toml
 [notify]
 events = ["success", "failure"]
 reporters = ["discord.default", "smtp.ops"]
+digest = "off"           # off | hourly | daily | weekly | monthly
 
 [reporters.discord.default]
 webhook_url = "https://discord.com/api/webhooks/..."
@@ -161,6 +163,23 @@ events = ["failure", "recovery", "stale"]   # email only wakes people for proble
 > `events = ["failure", "recovery"]`. `recovery` fires when a run succeeds
 > after a failure/timeout/stale/start-failure, independently of whether
 > `success` is enabled.
+
+If you still want regular visibility without one message per successful run,
+set `digest` globally or per job:
+
+```toml
+[notify]
+digest = "hourly"
+
+[jobs.frequent-health-check]
+events = ["failure", "recovery"]
+digest = "daily"         # overrides the global digest for this job
+```
+
+Digests are grouped by job, reporter, and UTC window, and include total runs,
+status counts, and duration stats for that job. They are sent by the first
+`run`/`flush` after the window closes; failures, recoveries, stale, and
+long-run alerts are still delivered immediately.
 
 Timeouts report as `failure` events with timeout detail. `--expected-duration`
 sends one mid-run `long_run` alert (the CLI flag implies the alert; from
