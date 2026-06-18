@@ -1,5 +1,6 @@
 //! Command implementations and the shared state-opening helper.
 
+pub mod configure;
 pub mod flush;
 pub mod inspect;
 pub mod maintain;

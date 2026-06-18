@@ -73,6 +73,14 @@ use in-process fake Discord/SMTP servers).
 - `src/capture.rs` / `src/redact.rs` — capped capture and redaction.
 - `src/reconcile.rs` + `src/liveness.rs` — stale-run detection
   (pid + /proc start time + boot id; never bare `kill(pid, 0)`).
+- `src/prompt.rs` — the `Ui` prompt trait with two backends: `TermUi`
+  (`inquire`-backed terminal UI) when stdin/stdout are a TTY, and `LinePrompt`
+  (line-at-a-time, generic over `BufRead`/`Write`) for pipes, CI, and tests, so
+  the wizard stays scriptable. Esc → `Cancel`, Ctrl-C → `Abort`.
+- `src/commands/configure.rs` — `config wizard` / `init --interactive`: the
+  menu-driven wizard plus the `Config`→TOML renderer (round-trip-tested against
+  the config parser). Writes 0600, backs up any existing file, and reuses
+  `notify test` for the optional end-of-wizard test send.
 
 ## Spec
 

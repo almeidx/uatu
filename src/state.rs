@@ -1,7 +1,8 @@
 //! State directory layout and preparation (SPEC §7): dirs 0700, files 0600.
 
-use std::fs::DirBuilder;
-use std::os::unix::fs::DirBuilderExt;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -37,6 +38,23 @@ pub fn mkdir_0700_all(path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
+
+/// Write `bytes` to `target` with 0600 permissions, truncating any existing
+/// file. Config files can hold webhook URLs / SMTP passwords, so permissions
+/// are tightened through the open file handle (avoiding a path-based TOCTOU)
+/// *before* any bytes are written: the file is already truncated to empty at
+/// this point, so a pre-existing loose-mode file (`create().mode()` only
+/// applies on creation) never briefly holds world-readable secrets.
+pub fn write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(target)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
 }
 
 /// Free bytes available to unprivileged users on the filesystem holding
