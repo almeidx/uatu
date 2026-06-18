@@ -121,7 +121,7 @@ impl<'de> Deserialize<'de> for DigestPeriod {
             "weekly" => Ok(DigestPeriod::Weekly),
             "monthly" => Ok(DigestPeriod::Monthly),
             _ => Err(serde::de::Error::custom(
-                "invalid digest (valid: off, hourly, daily, weekly, monthly)",
+                "invalid digest period (valid: off, hourly, daily, weekly, monthly)",
             )),
         }
     }

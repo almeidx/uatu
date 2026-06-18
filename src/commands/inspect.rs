@@ -100,8 +100,8 @@ fn delivery_json(d: &DeliveryRow) -> serde_json::Value {
         "delivered_at": d.delivered_ms.map(rfc3339),
         "last_error": d.last_error,
         "digest_period": d.digest_period,
-        "digest_window_start": d.digest_start_ms.map(rfc3339),
-        "digest_window_end": d.digest_end_ms.map(rfc3339),
+        "digest_window_start_at": d.digest_start_ms.map(rfc3339),
+        "digest_window_end_at": d.digest_end_ms.map(rfc3339),
     })
 }
 
