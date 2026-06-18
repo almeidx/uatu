@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::util::now_ms;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Run statuses (SPEC §7). Stored as snake_case strings.
 pub const STATUSES: [&str; 6] = [
@@ -117,6 +117,16 @@ pub struct DeliveryRow {
     pub owner_pid: Option<i64>,
     pub owner_start_ticks: Option<i64>,
     pub owner_boot_id: Option<String>,
+    pub digest_period: Option<String>,
+    pub digest_start_ms: Option<i64>,
+    pub digest_end_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliveryDigest {
+    pub period: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
 pub struct Db {
@@ -175,6 +185,20 @@ impl Db {
         }
         if v == SCHEMA_VERSION {
             return Ok(false);
+        }
+        if v == 1 {
+            self.conn.execute_batch(
+                r#"
+BEGIN EXCLUSIVE;
+ALTER TABLE deliveries ADD COLUMN digest_period TEXT;
+ALTER TABLE deliveries ADD COLUMN digest_start_ms INTEGER;
+ALTER TABLE deliveries ADD COLUMN digest_end_ms INTEGER;
+CREATE INDEX IF NOT EXISTS idx_deliv_digest ON deliveries(state, event, reporter, job_id, digest_period, digest_start_ms, digest_end_ms);
+PRAGMA user_version = 2;
+COMMIT;
+"#,
+            )?;
+            return Ok(true);
         }
         // Forward-only migration inside an exclusive transaction (SPEC §7).
         self.conn.execute_batch(
@@ -237,11 +261,15 @@ CREATE TABLE IF NOT EXISTS deliveries (
   last_error TEXT,
   owner_pid INTEGER,
   owner_start_ticks INTEGER,
-  owner_boot_id TEXT
+  owner_boot_id TEXT,
+  digest_period TEXT,
+  digest_start_ms INTEGER,
+  digest_end_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_deliv_state ON deliveries(state, next_attempt_ms);
 CREATE INDEX IF NOT EXISTS idx_deliv_run ON deliveries(run_id);
-PRAGMA user_version = 1;
+CREATE INDEX IF NOT EXISTS idx_deliv_digest ON deliveries(state, event, reporter, job_id, digest_period, digest_start_ms, digest_end_ms);
+PRAGMA user_version = 2;
 COMMIT;
 "#,
         )?;
@@ -519,10 +547,62 @@ GROUP BY inferred_basename HAVING c > ?2 ORDER BY c DESC"#,
         next_attempt_ms: Option<i64>,
         owner: Option<&crate::liveness::Liveness>,
     ) -> Result<i64, StateError> {
+        self.insert_delivery_inner(
+            run_id,
+            job_id,
+            event,
+            reporter,
+            state,
+            created_ms,
+            next_attempt_ms,
+            owner,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_digest_delivery(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        event: &str,
+        reporter: &str,
+        state: &str,
+        created_ms: i64,
+        next_attempt_ms: Option<i64>,
+        owner: Option<&crate::liveness::Liveness>,
+        digest: &DeliveryDigest,
+    ) -> Result<i64, StateError> {
+        self.insert_delivery_inner(
+            run_id,
+            job_id,
+            event,
+            reporter,
+            state,
+            created_ms,
+            next_attempt_ms,
+            owner,
+            Some(digest),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_delivery_inner(
+        &self,
+        run_id: &str,
+        job_id: &str,
+        event: &str,
+        reporter: &str,
+        state: &str,
+        created_ms: i64,
+        next_attempt_ms: Option<i64>,
+        owner: Option<&crate::liveness::Liveness>,
+        digest: Option<&DeliveryDigest>,
+    ) -> Result<i64, StateError> {
         self.conn.execute(
             r#"INSERT INTO deliveries
-(run_id, job_id, event, reporter, state, attempt_count, created_ms, next_attempt_ms, owner_pid, owner_start_ticks, owner_boot_id)
-VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10)"#,
+(run_id, job_id, event, reporter, state, attempt_count, created_ms, next_attempt_ms, owner_pid, owner_start_ticks, owner_boot_id, digest_period, digest_start_ms, digest_end_ms)
+VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10,?11,?12,?13)"#,
             params![
                 run_id,
                 job_id,
@@ -534,6 +614,9 @@ VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10)"#,
                 owner.map(|o| o.pid as i64),
                 owner.map(|o| o.start_ticks as i64),
                 owner.map(|o| o.boot_id.clone()),
+                digest.map(|d| d.period.clone()),
+                digest.map(|d| d.start_ms),
+                digest.map(|d| d.end_ms),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -555,6 +638,9 @@ VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10)"#,
             owner_pid: row.get("owner_pid")?,
             owner_start_ticks: row.get("owner_start_ticks")?,
             owner_boot_id: row.get("owner_boot_id")?,
+            digest_period: row.get("digest_period")?,
+            digest_start_ms: row.get("digest_start_ms")?,
+            digest_end_ms: row.get("digest_end_ms")?,
         })
     }
 
@@ -590,6 +676,69 @@ VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10)"#,
             params![id, owner.pid as i64, owner.start_ticks as i64, owner.boot_id],
         )?;
         Ok(n == 1)
+    }
+
+    pub fn claim_digest_group(
+        &self,
+        row: &DeliveryRow,
+        owner: &crate::liveness::Liveness,
+        now: i64,
+    ) -> Result<Vec<DeliveryRow>, StateError> {
+        let (Some(period), Some(start), Some(end)) = (
+            row.digest_period.as_deref(),
+            row.digest_start_ms,
+            row.digest_end_ms,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let n = self.conn.execute(
+            r#"UPDATE deliveries
+SET state='sending', owner_pid=?7, owner_start_ticks=?8, owner_boot_id=?9
+WHERE state='queued'
+  AND event=?1 AND reporter=?2 AND job_id=?3
+  AND digest_period=?4 AND digest_start_ms=?5 AND digest_end_ms=?6
+  AND next_attempt_ms <= ?10"#,
+            params![
+                row.event,
+                row.reporter,
+                row.job_id,
+                period,
+                start,
+                end,
+                owner.pid as i64,
+                owner.start_ticks as i64,
+                owner.boot_id,
+                now,
+            ],
+        )?;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            r#"SELECT * FROM deliveries
+WHERE state='sending'
+  AND event=?1 AND reporter=?2 AND job_id=?3
+  AND digest_period=?4 AND digest_start_ms=?5 AND digest_end_ms=?6
+  AND owner_pid=?7 AND owner_start_ticks=?8 AND owner_boot_id=?9
+ORDER BY created_ms ASC, id ASC"#,
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    row.event,
+                    row.reporter,
+                    row.job_id,
+                    period,
+                    start,
+                    end,
+                    owner.pid as i64,
+                    owner.start_ticks as i64,
+                    owner.boot_id,
+                ],
+                Self::row_to_delivery,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn delivery_delivered(&self, id: i64, now: i64) -> Result<(), StateError> {
@@ -873,6 +1022,54 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn migrates_v1_delivery_rows_for_digest_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uatu.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+CREATE TABLE deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  reporter TEXT NOT NULL,
+  state TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_ms INTEGER NOT NULL,
+  next_attempt_ms INTEGER,
+  delivered_ms INTEGER,
+  last_error TEXT,
+  owner_pid INTEGER,
+  owner_start_ticks INTEGER,
+  owner_boot_id TEXT
+);
+PRAGMA user_version = 1;
+"#,
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let mut stmt = db.conn.prepare("PRAGMA table_info(deliveries)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(columns.contains(&"digest_period".to_string()));
+        assert!(columns.contains(&"digest_start_ms".to_string()));
+        assert!(columns.contains(&"digest_end_ms".to_string()));
     }
 
     #[test]

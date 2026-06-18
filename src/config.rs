@@ -56,6 +56,110 @@ pub enum CaptureMode {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestPeriod {
+    Off,
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl DigestPeriod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DigestPeriod::Off => "off",
+            DigestPeriod::Hourly => "hourly",
+            DigestPeriod::Daily => "daily",
+            DigestPeriod::Weekly => "weekly",
+            DigestPeriod::Monthly => "monthly",
+        }
+    }
+
+    pub fn window_for(self, ms: i64) -> Option<(i64, i64)> {
+        const HOUR_MS: i64 = 3_600_000;
+        const DAY_MS: i64 = 86_400_000;
+        match self {
+            DigestPeriod::Off => None,
+            DigestPeriod::Hourly => Some(fixed_window(ms, HOUR_MS)),
+            DigestPeriod::Daily => Some(fixed_window(ms, DAY_MS)),
+            DigestPeriod::Weekly => {
+                let days = ms.div_euclid(DAY_MS);
+                // 1970-01-01 was Thursday; ISO-style UTC weeks start Monday.
+                let start_days = (days + 3).div_euclid(7) * 7 - 3;
+                Some((
+                    start_days.saturating_mul(DAY_MS),
+                    (start_days + 7).saturating_mul(DAY_MS),
+                ))
+            }
+            DigestPeriod::Monthly => {
+                let days = ms.div_euclid(DAY_MS);
+                let (year, month, _) = civil_from_days(days);
+                let start_days = days_from_civil(year, month, 1);
+                let (next_year, next_month) = if month == 12 {
+                    (year + 1, 1)
+                } else {
+                    (year, month + 1)
+                };
+                let end_days = days_from_civil(next_year, next_month, 1);
+                Some((
+                    start_days.saturating_mul(DAY_MS),
+                    end_days.saturating_mul(DAY_MS),
+                ))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DigestPeriod {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "off" | "none" | "disabled" => Ok(DigestPeriod::Off),
+            "hourly" => Ok(DigestPeriod::Hourly),
+            "daily" => Ok(DigestPeriod::Daily),
+            "weekly" => Ok(DigestPeriod::Weekly),
+            "monthly" => Ok(DigestPeriod::Monthly),
+            _ => Err(serde::de::Error::custom(
+                "invalid digest period (valid: off, hourly, daily, weekly, monthly)",
+            )),
+        }
+    }
+}
+
+fn fixed_window(ms: i64, width_ms: i64) -> (i64, i64) {
+    let start = ms.div_euclid(width_ms).saturating_mul(width_ms);
+    (start, start.saturating_add(width_ms))
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's civil calendar algorithms, with z = days since Unix epoch.
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    y -= i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmtpTls {
@@ -103,6 +207,7 @@ pub struct NotifyCfg {
     pub events: Option<Vec<String>>,
     pub reporters: Option<Vec<String>>,
     pub failure_output: Option<bool>,
+    pub digest: Option<DigestPeriod>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -143,6 +248,7 @@ pub struct JobCfg {
     pub capture_tail_bytes: Option<ByteSize>,
     pub kill_grace: Option<Dur>,
     pub failure_output: Option<bool>,
+    pub digest: Option<DigestPeriod>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -410,7 +516,7 @@ const GLOBAL_KEYS: &[&str] = &[
 const RETENTION_KEYS: &[&str] = &["max_age", "max_bytes"];
 const LOG_KEYS: &[&str] = &["path", "max_bytes", "trim"];
 const REDACTION_KEYS: &[&str] = &["literals", "regex"];
-const NOTIFY_KEYS: &[&str] = &["events", "reporters", "failure_output"];
+const NOTIFY_KEYS: &[&str] = &["events", "reporters", "failure_output", "digest"];
 const DISCORD_KEYS: &[&str] = &["webhook_url", "max_message_chars", "events"];
 const SMTP_KEYS: &[&str] = &[
     "host",
@@ -438,6 +544,7 @@ const JOB_KEYS: &[&str] = &[
     "capture_tail_bytes",
     "kill_grace",
     "failure_output",
+    "digest",
 ];
 
 /// Walk the parsed document against the known-key schema, returning one
@@ -630,6 +737,14 @@ pub fn log_max_bytes(cfg: &Config) -> u64 {
     cfg.log.max_bytes.map(|b| b.0).unwrap_or(DEFAULT_LOG_MAX)
 }
 
+pub fn digest_period(cfg: &Config, job_id: &str) -> DigestPeriod {
+    cfg.jobs
+        .get(job_id)
+        .and_then(|j| j.digest)
+        .or(cfg.notify.digest)
+        .unwrap_or(DigestPeriod::Off)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,6 +858,33 @@ recipients = ["o@x"]
         let secrets = out.config.auto_secrets();
         assert!(secrets.contains(&"https://discord.com/api/webhooks/1/abc".to_string()));
         assert!(secrets.contains(&"smtp-pass".to_string()));
+    }
+
+    #[test]
+    fn digest_precedence_and_utc_windows() {
+        let out = parse(
+            r#"
+[notify]
+digest = "hourly"
+[jobs.fast]
+digest = "daily"
+[jobs.immediate]
+digest = "off"
+"#,
+        );
+        let cfg = out.config;
+        assert_eq!(digest_period(&cfg, "other"), DigestPeriod::Hourly);
+        assert_eq!(digest_period(&cfg, "fast"), DigestPeriod::Daily);
+        assert_eq!(digest_period(&cfg, "immediate"), DigestPeriod::Off);
+
+        let ms = 1_700_000_000_000; // 2023-11-14T22:13:20Z
+        let (week_start, week_end) = DigestPeriod::Weekly.window_for(ms).unwrap();
+        assert_eq!(crate::util::rfc3339(week_start), "2023-11-13T00:00:00Z");
+        assert_eq!(crate::util::rfc3339(week_end), "2023-11-20T00:00:00Z");
+
+        let (month_start, month_end) = DigestPeriod::Monthly.window_for(ms).unwrap();
+        assert_eq!(crate::util::rfc3339(month_start), "2023-11-01T00:00:00Z");
+        assert_eq!(crate::util::rfc3339(month_end), "2023-12-01T00:00:00Z");
     }
 
     #[test]

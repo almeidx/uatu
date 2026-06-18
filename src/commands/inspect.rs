@@ -99,6 +99,9 @@ fn delivery_json(d: &DeliveryRow) -> serde_json::Value {
         "next_attempt_at": d.next_attempt_ms.map(rfc3339),
         "delivered_at": d.delivered_ms.map(rfc3339),
         "last_error": d.last_error,
+        "digest_period": d.digest_period,
+        "digest_window_start_at": d.digest_start_ms.map(rfc3339),
+        "digest_window_end_at": d.digest_end_ms.map(rfc3339),
     })
 }
 
@@ -331,7 +334,7 @@ pub fn cmd_show(args: ShowArgs) -> i32 {
         println!("deliveries:");
         for d in &deliveries {
             println!(
-                "  - event={} reporter={} state={} attempts={}{}{}{}",
+                "  - event={} reporter={} state={} attempts={}{}{}{}{}",
                 d.event,
                 d.reporter,
                 d.state,
@@ -343,6 +346,12 @@ pub fn cmd_show(args: ShowArgs) -> i32 {
                     .filter(|_| d.state == "queued")
                     .map(|m| format!(" next_attempt_at={}", rfc3339(m)))
                     .unwrap_or_default(),
+                match (&d.digest_period, d.digest_start_ms, d.digest_end_ms) {
+                    (Some(period), Some(start), Some(end)) => {
+                        format!(" digest={}({}..{})", period, rfc3339(start), rfc3339(end))
+                    }
+                    _ => String::new(),
+                },
                 d.last_error
                     .as_deref()
                     .map(|e| format!(" last_error={e:?}"))

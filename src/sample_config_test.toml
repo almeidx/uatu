@@ -32,6 +32,7 @@ regex = [
 events = ["success", "failure"]
 reporters = ["discord.default", "smtp.ops"]
 failure_output = true
+digest = "off"
 
 [reporters.discord.default]
 webhook_url = "https://discord.com/api/webhooks/..."
@@ -56,5 +57,6 @@ expected_duration = "45m"
 schedule_label = "nightly at 02:00"
 reporters = ["discord.default", "smtp.ops"]
 events = ["success", "failure", "recovery", "stale", "long_run"]
+digest = "daily"
 capture_stdout = true
 capture_stderr = true

@@ -14,14 +14,16 @@ pub enum Event {
     Recovery,
     Stale,
     LongRun,
+    Digest,
 }
 
-pub const ALL_EVENTS: [Event; 5] = [
+pub const ALL_EVENTS: [Event; 6] = [
     Event::Success,
     Event::Failure,
     Event::Recovery,
     Event::Stale,
     Event::LongRun,
+    Event::Digest,
 ];
 
 impl Event {
@@ -32,6 +34,7 @@ impl Event {
             Event::Recovery => "recovery",
             Event::Stale => "stale",
             Event::LongRun => "long_run",
+            Event::Digest => "digest",
         }
     }
 
@@ -42,6 +45,7 @@ impl Event {
             "recovery" => Some(Event::Recovery),
             "stale" => Some(Event::Stale),
             "long_run" => Some(Event::LongRun),
+            "digest" => Some(Event::Digest),
             _ => None,
         }
     }
@@ -57,7 +61,7 @@ pub fn parse_events(list: &[String], warnings: &mut Vec<String>) -> BTreeSet<Eve
                 set.insert(e);
             }
             None => warnings.push(format!(
-                "unknown event {s:?} (valid: success, failure, recovery, stale, long_run)"
+                "unknown event {s:?} (valid: success, failure, recovery, stale, long_run, digest)"
             )),
         }
     }
@@ -139,6 +143,15 @@ pub fn reporters_for_event(
         .collect()
 }
 
+/// Digest targets are controlled by `digest`, not by job-effective `events`.
+/// Per-reporter event filters may still opt out by omitting `digest`.
+pub fn reporters_for_digest(cfg: &Config, job_id: &str) -> Vec<String> {
+    job_reporters(cfg, job_id)
+        .into_iter()
+        .filter(|name| reporter_accepts(cfg, name, Event::Digest))
+        .collect()
+}
+
 /// Everything needed to render one notification.
 pub struct MsgCtx<'a> {
     pub run: &'a RunRow,
@@ -151,6 +164,18 @@ pub struct MsgCtx<'a> {
     pub output_files: Vec<String>,
 }
 
+/// Everything needed to render one digest notification.
+pub struct DigestMsgCtx<'a> {
+    pub job_id: &'a str,
+    pub period: &'a str,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub host: &'a str,
+    pub runs: &'a [RunRow],
+    /// `Some((due_ms, now_ms))` when a digest retry is delayed.
+    pub delayed: Option<(i64, i64)>,
+}
+
 fn event_color(event: Event, run: &RunRow) -> u32 {
     match event {
         Event::Success | Event::Recovery => 0x2ECC71, // green
@@ -158,6 +183,7 @@ fn event_color(event: Event, run: &RunRow) -> u32 {
         Event::Failure => 0xE74C3C,                   // red
         Event::LongRun => 0xF1C40F,                   // yellow
         Event::Stale => 0x95A5A6,                     // grey
+        Event::Digest => 0x3498DB,                    // blue
     }
 }
 
@@ -187,6 +213,16 @@ fn delayed_line(delayed: Option<(i64, i64)>) -> Option<String> {
         format!(
             "DELAYED NOTIFICATION: event occurred at {}, delivered at {}",
             rfc3339(event_ms),
+            rfc3339(now_ms)
+        )
+    })
+}
+
+fn delayed_digest_line(delayed: Option<(i64, i64)>) -> Option<String> {
+    delayed.map(|(due_ms, now_ms)| {
+        format!(
+            "DELAYED DIGEST RETRY: digest was due at {}, delivered at {}",
+            rfc3339(due_ms),
             rfc3339(now_ms)
         )
     })
@@ -280,6 +316,106 @@ pub fn discord_payload(ctx: &MsgCtx, max_message_chars: Option<usize>) -> serde_
     })
 }
 
+fn digest_lines(ctx: &DigestMsgCtx, discord: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(d) = delayed_digest_line(ctx.delayed) {
+        lines.push(d);
+    }
+    lines.push(format!("host: {}", ctx.host));
+    lines.push(format!("period: {}", ctx.period));
+    lines.push(format!(
+        "window: {} to {} (UTC)",
+        rfc3339(ctx.window_start_ms),
+        rfc3339(ctx.window_end_ms)
+    ));
+    lines.push(format!("total runs: {}", ctx.runs.len()));
+    let count = |status: &str| ctx.runs.iter().filter(|r| r.status == status).count();
+    let success = count("success");
+    let failure = count("failure");
+    let timeout = count("timeout");
+    let start_failed = count("start_failed");
+    let stale = count("stale");
+    lines.push(format!(
+        "statuses: success={success}, failure={failure}, timeout={timeout}, start_failed={start_failed}, stale={stale}"
+    ));
+    let durations: Vec<i64> = ctx
+        .runs
+        .iter()
+        .filter(|r| !r.end_is_detection)
+        .filter_map(|r| r.duration_ms())
+        .collect();
+    if !durations.is_empty() {
+        let total: i64 = durations.iter().sum();
+        let avg = (total / durations.len() as i64).max(0) as u64;
+        let max = durations.iter().copied().max().unwrap_or(0).max(0) as u64;
+        lines.push(format!(
+            "duration: avg {}, max {}",
+            format_duration_ms(avg),
+            format_duration_ms(max)
+        ));
+    }
+    if let Some(first) = ctx.runs.first() {
+        lines.push(format!("first run: {}", rfc3339(first.start_ms)));
+    }
+    if let Some(last) = ctx.runs.last() {
+        let end = last.end_ms.unwrap_or(last.start_ms);
+        lines.push(format!("last run: {}", rfc3339(end)));
+    }
+
+    let shown = ctx.runs.len().min(10);
+    if shown > 0 {
+        lines.push("recent runs:".to_string());
+        let start = ctx.runs.len().saturating_sub(shown);
+        for run in &ctx.runs[start..] {
+            let short_id: String = run.run_id.chars().take(8).collect();
+            let duration = run
+                .duration_ms()
+                .filter(|_| !run.end_is_detection)
+                .map(|d| format_duration_ms(d.max(0) as u64))
+                .unwrap_or_else(|| "-".to_string());
+            let started = if discord {
+                format!("<t:{}:f>", run.start_ms / 1000)
+            } else {
+                rfc3339(run.start_ms)
+            };
+            lines.push(format!(
+                "- {short_id} started {started}, duration {duration}"
+            ));
+        }
+        let omitted = ctx.runs.len().saturating_sub(shown);
+        if omitted > 0 {
+            lines.push(format!("... and {omitted} earlier run(s)"));
+        }
+    }
+    lines
+}
+
+pub fn discord_digest_payload(
+    ctx: &DigestMsgCtx,
+    max_message_chars: Option<usize>,
+) -> serde_json::Value {
+    let cap = max_message_chars
+        .unwrap_or(DEFAULT_DISCORD_MAX_CHARS)
+        .min(4096);
+    let title = format!("DIGEST: {}", ctx.job_id);
+    let mut description = digest_lines(ctx, true).join("\n");
+    if description.chars().count() > cap {
+        description = description
+            .chars()
+            .take(cap.saturating_sub(1))
+            .collect::<String>()
+            + "…";
+    }
+
+    serde_json::json!({
+        "embeds": [{
+            "title": title,
+            "description": description,
+            "color": 0x3498DBu32,
+        }]
+    })
+}
+
 /// SMTP subject + plain-text body (SPEC §8). Subject:
 /// `[uatu] <EVENT>: <job-id> on <host>`. Body shows UTC and host-local time.
 pub fn email_message(ctx: &MsgCtx, max_message_chars: Option<usize>) -> (String, String) {
@@ -338,6 +474,19 @@ pub fn email_message(ctx: &MsgCtx, max_message_chars: Option<usize>) -> (String,
             body.push_str(&format!("  {f}\n"));
         }
     }
+    if body.chars().count() > cap {
+        body = body.chars().take(cap.saturating_sub(1)).collect::<String>() + "…";
+    }
+    (subject, body)
+}
+
+pub fn digest_email_message(
+    ctx: &DigestMsgCtx,
+    max_message_chars: Option<usize>,
+) -> (String, String) {
+    let cap = max_message_chars.unwrap_or(DEFAULT_SMTP_MAX_CHARS);
+    let subject = format!("[uatu] DIGEST: {} on {}", ctx.job_id, ctx.host);
+    let mut body = digest_lines(ctx, false).join("\n");
     if body.chars().count() > cap {
         body = body.chars().take(cap.saturating_sub(1)).collect::<String>() + "…";
     }
