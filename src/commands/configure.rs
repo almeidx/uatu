@@ -733,9 +733,9 @@ fn ask_opt_string<U: Ui>(
     }
 }
 
-/// Like [`ask_opt_string`] but for secret values: the current value is never
-/// echoed (shown as `[unchanged]`), so re-editing a reporter does not print a
-/// stored password to the terminal. Blank keeps it, `-` clears it.
+/// Like [`ask_opt_string`] but for secret values: the input is masked (via
+/// `Ui::secret`) and the current value is never echoed. Blank keeps the current
+/// value, `-` clears it.
 fn ask_opt_secret<U: Ui>(
     p: &mut U,
     label: &str,
@@ -746,9 +746,8 @@ fn ask_opt_secret<U: Ui>(
     } else {
         format!("{label} (blank = none)")
     };
-    let placeholder = current.map(|_| "unchanged");
-    let ans = p.text(&hint, placeholder)?;
-    if current.is_some() && (ans == "unchanged" || ans.is_empty()) {
+    let ans = p.secret(&hint)?;
+    if current.is_some() && ans.is_empty() {
         return Ok(current.map(str::to_string));
     }
     if ans == "-" || ans.is_empty() {

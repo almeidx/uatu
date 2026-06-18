@@ -137,12 +137,12 @@ One TOML file: `--config PATH`, else `$XDG_CONFIG_HOME/uatu/uatu.toml`
 file interactively: a menu lets you pick what to configure — reporters,
 notification routing, per-job overrides, global/capture settings, retention and
 redaction — and every prompt offers a default. On a terminal you navigate menus
-with the **arrow keys or `j`/`k`**, Enter to choose, Space to toggle multi-selects;
-**Esc cancels the current section and steps back to the menu**, and Ctrl-C quits
-without saving. When input is piped or redirected it falls back to typing the
-option number, so it stays scriptable. It writes the file `0600`, keeps a `.bak`
-of any previous version, and can send a test notification through the reporters
-you just defined.
+with the **arrow keys or `j`/`k`** (type to filter long lists), Enter to choose,
+Space to toggle multi-selects, passwords masked; **Esc cancels the current
+section and steps back to the menu**, and Ctrl-C quits without saving. When input
+is piped or redirected it falls back to typing the option number, so it stays
+scriptable. It writes the file `0600`, keeps a `.bak` of any previous version,
+and can send a test notification through the reporters you just defined.
 
 Setting precedence: **CLI flag > job config > global config > built-in
 default**. `--env` entries merge over job-config `env` key-by-key.

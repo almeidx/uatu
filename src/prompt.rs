@@ -3,22 +3,23 @@
 //!
 //! Two backends behind one [`Ui`] trait:
 //!
-//! - [`TermUi`] — a raw-mode terminal UI with a highlighted cursor moved by the
-//!   arrow keys or `j`/`k`, Enter to choose, Space to toggle multi-selects.
-//!   **Esc cancels the current action and goes back; Ctrl-C aborts the wizard.**
-//!   Used when stdin and stdout are both a TTY.
-//! - [`LinePrompt`] — a dependency-light, line-at-a-time reader (type the option
-//!   number / `y`/`n`, press Enter). Used for pipes, redirected input, CI, and
-//!   every test. Generic over `BufRead`/`Write` so it runs against in-memory
-//!   buffers; it never produces a cancel/abort signal.
+//! - [`TermUi`] — a real terminal UI backed by the `inquire` crate: a
+//!   highlighted cursor moved with the arrow keys or `j`/`k`, type-to-filter,
+//!   Enter to choose, Space to toggle multi-selects, masked password entry,
+//!   **Esc to go back, Ctrl-C to quit**. Used when stdin and stdout are a TTY.
+//! - [`LinePrompt`] — a line-at-a-time reader (type the option number / `y`,`n`,
+//!   press Enter) for pipes, redirected input, CI, and every test, so the wizard
+//!   stays fully scriptable. Generic over `BufRead`/`Write`; it never cancels or
+//!   aborts.
 //!
 //! Input methods return [`PromptResult`]: `Err(PromptError::Cancel)` for Esc
 //! (the wizard returns to its menu) and `Err(PromptError::Abort)` for Ctrl-C
 //! (the wizard exits without saving). [`cmd_configure`](crate::commands::configure)
 //! picks the backend with [`stdio_is_tty`]. Blank input selects the default.
 
-use std::io::{self, BufRead, Write};
-use std::os::unix::io::RawFd;
+use std::io::{self, BufRead, IsTerminal, Write};
+
+use inquire::{Confirm, InquireError, MultiSelect, Password, PasswordDisplayMode, Select, Text};
 
 /// Outcome of an input prompt: a value, a "go back" (Esc), or a "quit the
 /// wizard" (Ctrl-C). I/O failures are carried as `Io`.
@@ -54,6 +55,12 @@ pub trait Ui {
         default_selected: &[bool],
     ) -> PromptResult<Vec<usize>>;
 
+    /// A secret value (e.g. an SMTP password). The default delegates to plain
+    /// text; the terminal backend masks the input so it is not echoed.
+    fn secret(&mut self, question: &str) -> PromptResult<String> {
+        self.text(question, None)
+    }
+
     fn blank(&mut self) -> io::Result<()> {
         self.say("")
     }
@@ -85,10 +92,12 @@ pub trait Ui {
     }
 }
 
-/// True only when stdin and stdout are both terminals — the condition for the
-/// raw-mode [`TermUi`]. Redirected input/output falls back to [`LinePrompt`].
+/// True only when stdin, stdout, and stderr are all terminals — the condition
+/// for the `inquire`-backed [`TermUi`]. inquire renders prompts to **stderr**,
+/// so a redirected stderr (`wizard 2>file`) would otherwise produce an invisible
+/// prompt; any redirected stream falls back to the scriptable [`LinePrompt`].
 pub fn stdio_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 }
+    io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal()
 }
 
 // ---------------------------------------------------------------------------
@@ -260,362 +269,79 @@ fn default_indices(selected: &[bool], len: usize) -> Vec<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal (raw-mode) backend
+// Terminal backend (the `inquire` crate)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Key {
-    Up,
-    Down,
-    Enter,
-    Space,
-    Backspace,
-    Esc,
-    Char(u8),
-    Interrupt,
-    Eof,
-    Other,
-}
-
-/// Decode the first key from a buffer of raw terminal bytes, returning the key
-/// and how many bytes it consumed (so batched input — fast typing, paste, or a
-/// test that feeds several keys at once — is decoded one key at a time). Arrow
-/// keys arrive as escape sequences (`ESC [ A` etc.); a lone ESC is `Esc`.
-fn decode_key(b: &[u8]) -> (Key, usize) {
-    match b {
-        [] => (Key::Eof, 0),
-        [0x1b, b'[', rest @ ..] | [0x1b, b'O', rest @ ..] => match rest.first() {
-            Some(b'A') => (Key::Up, 3),
-            Some(b'B') => (Key::Down, 3),
-            Some(_) => (Key::Other, 3),
-            None => (Key::Other, 2),
-        },
-        [0x1b, ..] => (Key::Esc, 1),
-        [b'\r', ..] | [b'\n', ..] => (Key::Enter, 1),
-        [0x7f, ..] | [0x08, ..] => (Key::Backspace, 1),
-        [b' ', ..] => (Key::Space, 1),
-        [0x03, ..] => (Key::Interrupt, 1),
-        [0x04, ..] => (Key::Eof, 1),
-        [c, ..] => (Key::Char(*c), 1),
+/// Map inquire's error to the wizard's cancel/abort signal. Esc cancels the
+/// current prompt; Ctrl-C interrupts; everything else is an I/O failure.
+fn map_err(e: InquireError) -> PromptError {
+    match e {
+        InquireError::OperationCanceled => PromptError::Cancel,
+        InquireError::OperationInterrupted => PromptError::Abort,
+        InquireError::IO(io) => PromptError::Io(io),
+        other => PromptError::Io(io::Error::other(other.to_string())),
     }
 }
 
-fn step(cur: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let l = len as isize;
-    (((cur as isize + delta) % l + l) % l) as usize
-}
-
-/// Remove the last UTF-8 scalar value from `buf` (pops trailing continuation
-/// bytes then the lead byte), so Backspace deletes a whole character.
-fn pop_utf8(buf: &mut Vec<u8>) {
-    while let Some(b) = buf.pop() {
-        // Stop after removing an ASCII byte or a UTF-8 lead byte (continuation
-        // bytes are 0x80..0xC0).
-        if !(0x80..0xc0).contains(&b) {
-            break;
-        }
-    }
-}
-
-/// RAII raw-mode: disables canonical mode, echo, signal generation and output
-/// post-processing on construction, restoring the saved settings on drop (so a
-/// normal return always leaves the terminal usable). Ctrl-C is read as a byte
-/// rather than a signal, so cancellation also restores cleanly.
-struct RawMode {
-    fd: RawFd,
-    orig: libc::termios,
-}
-
-impl RawMode {
-    fn enable(fd: RawFd) -> io::Result<RawMode> {
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let orig = t;
-            t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-            t.c_iflag &= !(libc::IXON | libc::ICRNL);
-            t.c_oflag &= !libc::OPOST;
-            t.c_cc[libc::VMIN] = 1;
-            t.c_cc[libc::VTIME] = 0;
-            if libc::tcsetattr(fd, libc::TCSANOW, &t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RawMode { fd, orig })
-        }
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
-        }
-    }
-}
-
-fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
-    while !buf.is_empty() {
-        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue; // EINTR (e.g. SIGWINCH) — retry rather than fail the UI
-            }
-            return Err(e);
-        }
-        if n == 0 {
-            break;
-        }
-        buf = &buf[n as usize..];
-    }
-    Ok(())
-}
-
-/// Wait up to `timeout_ms` for `fd` to become readable. Used to tell a lone ESC
-/// apart from the start of an arrow-key sequence split across reads.
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    r > 0 && (pfd.revents & libc::POLLIN) != 0
-}
-
-/// How long to wait for the rest of an escape sequence before deciding a lone
-/// ESC byte really means the Esc key.
-const ESC_TIMEOUT_MS: i32 = 50;
-
-pub struct TermUi {
-    in_fd: RawFd,
-    out_fd: RawFd,
-    /// Raw bytes read but not yet consumed: a single `read` can return several
-    /// keys at once, so they are decoded one at a time from here.
-    inbuf: Vec<u8>,
-    eof: bool,
-}
-
-impl Default for TermUi {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Default)]
+pub struct TermUi;
 
 impl TermUi {
     pub fn new() -> TermUi {
-        TermUi {
-            in_fd: libc::STDIN_FILENO,
-            out_fd: libc::STDOUT_FILENO,
-            inbuf: Vec::new(),
-            eof: false,
-        }
+        TermUi
     }
-
-    #[cfg(test)]
-    fn with_fds(in_fd: RawFd, out_fd: RawFd) -> TermUi {
-        TermUi {
-            in_fd,
-            out_fd,
-            inbuf: Vec::new(),
-            eof: false,
-        }
-    }
-
-    fn w(&self, s: &str) -> io::Result<()> {
-        write_all_fd(self.out_fd, s.as_bytes())
-    }
-
-    /// Blocking read into a temp buffer, retrying on EINTR.
-    fn read_some(&self, tmp: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let n =
-                unsafe { libc::read(self.in_fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue; // EINTR (e.g. SIGWINCH) — retry rather than abort the UI
-                }
-                return Err(e);
-            }
-            return Ok(n as usize);
-        }
-    }
-
-    /// Read one key (raw mode), refilling the buffer only when it is empty.
-    fn read_key(&mut self) -> io::Result<Key> {
-        if self.inbuf.is_empty() {
-            let mut tmp = [0u8; 16];
-            let n = self.read_some(&mut tmp)?;
-            if n == 0 {
-                return Ok(Key::Eof);
-            }
-            self.inbuf.extend_from_slice(&tmp[..n]);
-        }
-        // A lone ESC may be the first byte of an arrow-key sequence split across
-        // reads. Briefly wait for the rest before treating it as the Esc key, so
-        // navigation is not mistaken for cancel on slow/loaded terminals.
-        if self.inbuf == [0x1b] && poll_readable(self.in_fd, ESC_TIMEOUT_MS) {
-            let mut tmp = [0u8; 16];
-            let n = self.read_some(&mut tmp)?;
-            self.inbuf.extend_from_slice(&tmp[..n]);
-        }
-        let (key, consumed) = decode_key(&self.inbuf);
-        self.inbuf.drain(..consumed.min(self.inbuf.len()));
-        Ok(key)
-    }
-
-    /// Collapse a finished prompt: move up over the `lines` it rendered, erase
-    /// them, and leave only `summary` behind (empty `summary` erases the prompt
-    /// entirely). This keeps the scrollback to one compact line per answer
-    /// instead of a stack of full menus.
-    fn finish_block(&self, lines: usize, summary: &str) -> io::Result<()> {
-        let up = if lines > 0 {
-            format!("\x1b[{lines}A")
-        } else {
-            String::new()
-        };
-        self.w(&format!("{up}\r\x1b[J{summary}"))
-    }
-}
-
-/// A finished selection rendered as ` answer` in bold, for the collapsed line.
-fn chosen_summary(question: &str, answer: &str) -> String {
-    format!("{question} \x1b[1m{answer}\x1b[0m\r\n")
 }
 
 impl Ui for TermUi {
     fn say(&mut self, line: &str) -> io::Result<()> {
-        self.w(&format!("{line}\n"))
+        let mut out = io::stdout().lock();
+        writeln!(out, "{line}")?;
+        out.flush()
     }
 
     fn at_eof(&self) -> bool {
-        self.eof
+        false
     }
 
     fn text(&mut self, question: &str, default: Option<&str>) -> PromptResult<String> {
-        let _raw = RawMode::enable(self.in_fd)?;
-        let suffix = match default {
-            Some(d) if !d.is_empty() => format!(" [{d}]"),
-            _ => String::new(),
-        };
-        let prompt = format!("{question}{suffix}: ");
-        self.w(&prompt)?;
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            match self.read_key()? {
-                Key::Enter | Key::Eof => {
-                    self.w("\r\n")?;
-                    let s = String::from_utf8_lossy(&buf);
-                    let s = s.trim();
-                    return Ok(if s.is_empty() {
-                        default.unwrap_or("").to_string()
-                    } else {
-                        s.to_string()
-                    });
-                }
-                Key::Esc => {
-                    self.w("\r\x1b[2K")?;
-                    return Err(PromptError::Cancel);
-                }
-                Key::Interrupt => {
-                    self.w("\r\x1b[2K")?;
-                    return Err(PromptError::Abort);
-                }
-                Key::Backspace => pop_utf8(&mut buf),
-                Key::Space => buf.push(b' '),
-                Key::Char(c) if c >= 0x20 => buf.push(c),
-                _ => continue,
+        let mut t = Text::new(question);
+        if let Some(d) = default {
+            if !d.is_empty() {
+                t = t.with_default(d);
             }
-            self.w(&format!(
-                "\r\x1b[2K{prompt}{}",
-                String::from_utf8_lossy(&buf)
-            ))?;
         }
+        t.prompt().map_err(map_err)
+    }
+
+    fn secret(&mut self, question: &str) -> PromptResult<String> {
+        Password::new(question)
+            .without_confirmation()
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .with_help_message("input hidden \u{00b7} enter submits \u{00b7} esc back")
+            .prompt()
+            .map_err(map_err)
     }
 
     fn confirm(&mut self, question: &str, default: bool) -> PromptResult<bool> {
-        let _raw = RawMode::enable(self.in_fd)?;
-        let hint = if default { "[Y/n]" } else { "[y/N]" };
-        self.w(&format!("{question} {hint} (esc back) "))?;
-        let result = loop {
-            match self.read_key()? {
-                Key::Char(b'y') | Key::Char(b'Y') => break Ok(true),
-                Key::Char(b'n') | Key::Char(b'N') => break Ok(false),
-                Key::Enter => break Ok(default),
-                Key::Esc => break Err(PromptError::Cancel),
-                Key::Interrupt => break Err(PromptError::Abort),
-                Key::Eof => {
-                    self.eof = true;
-                    break Ok(default);
-                }
-                _ => {}
-            }
-        };
-        let summary = match &result {
-            Ok(b) => chosen_summary(question, if *b { "yes" } else { "no" }),
-            Err(_) => String::new(),
-        };
-        self.finish_block(0, &summary)?;
-        result
+        Confirm::new(question)
+            .with_default(default)
+            .prompt()
+            .map_err(map_err)
     }
 
     fn select(&mut self, question: &str, options: &[&str], default: usize) -> PromptResult<usize> {
         if options.is_empty() {
             return Ok(0);
         }
-        let _raw = RawMode::enable(self.in_fd)?;
-        let n = options.len();
-        let mut sel = default.min(n - 1);
-        self.w("\x1b[?25l")?;
-        self.w(&format!("{question}\r\n"))?;
-        self.w("  (\u{2191}/\u{2193} or j/k move \u{00b7} enter choose \u{00b7} esc back)\r\n")?;
-        let mut first = true;
-        let result = loop {
-            if !first {
-                self.w(&format!("\x1b[{n}A"))?;
-            }
-            first = false;
-            for (i, opt) in options.iter().enumerate() {
-                // Radio buttons: filled ● = current pick, hollow ○ = the rest,
-                // so every line reads as a selectable option.
-                if i == sel {
-                    self.w(&format!("\r\x1b[2K\x1b[7m \u{25cf} {opt} \x1b[0m\r\n"))?;
-                } else {
-                    self.w(&format!("\r\x1b[2K \u{25cb} {opt}\r\n"))?;
-                }
-            }
-            match self.read_key()? {
-                Key::Up | Key::Char(b'k') => sel = step(sel, n, -1),
-                Key::Down | Key::Char(b'j') => sel = step(sel, n, 1),
-                Key::Char(c @ b'1'..=b'9') => {
-                    let d = (c - b'0') as usize;
-                    if d <= n {
-                        sel = d - 1;
-                    }
-                }
-                Key::Enter => break Ok(sel),
-                Key::Esc => break Err(PromptError::Cancel),
-                Key::Interrupt => break Err(PromptError::Abort),
-                Key::Eof => {
-                    self.eof = true;
-                    break Ok(sel);
-                }
-                _ => {}
-            }
-        };
-        let summary = match &result {
-            Ok(sel) => chosen_summary(question, options[*sel]),
-            Err(_) => String::new(),
-        };
-        self.finish_block(n + 2, &summary)?;
-        self.w("\x1b[?25h")?;
-        result
+        let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+        let start = default.min(opts.len() - 1);
+        Select::new(question, opts)
+            .with_starting_cursor(start)
+            .with_vim_mode(true)
+            .with_help_message("\u{2191}\u{2193}/jk move \u{00b7} enter select \u{00b7} esc back")
+            .raw_prompt()
+            .map(|o| o.index)
+            .map_err(map_err)
     }
 
     fn multi_select(
@@ -624,63 +350,21 @@ impl Ui for TermUi {
         options: &[&str],
         default_selected: &[bool],
     ) -> PromptResult<Vec<usize>> {
-        let n = options.len();
-        if n == 0 {
+        if options.is_empty() {
+            // inquire errors on an empty list; match select / LinePrompt instead.
             return Ok(Vec::new());
         }
-        let _raw = RawMode::enable(self.in_fd)?;
-        let mut chosen: Vec<bool> = (0..n)
-            .map(|i| default_selected.get(i).copied().unwrap_or(false))
-            .collect();
-        let mut cur = 0usize;
-        self.w("\x1b[?25l")?;
-        self.w(&format!("{question}\r\n"))?;
-        self.w("  (\u{2191}/\u{2193} or j/k move \u{00b7} space toggle \u{00b7} a/n all/none \u{00b7} enter ok \u{00b7} esc back)\r\n")?;
-        let mut first = true;
-        let result = loop {
-            if !first {
-                self.w(&format!("\x1b[{n}A"))?;
-            }
-            first = false;
-            for (i, opt) in options.iter().enumerate() {
-                let mark = if chosen[i] { "[x]" } else { "[ ]" };
-                if i == cur {
-                    self.w(&format!("\r\x1b[2K\x1b[7m> {mark} {opt} \x1b[0m\r\n"))?;
-                } else {
-                    self.w(&format!("\r\x1b[2K  {mark} {opt}\r\n"))?;
-                }
-            }
-            match self.read_key()? {
-                Key::Up | Key::Char(b'k') => cur = step(cur, n, -1),
-                Key::Down | Key::Char(b'j') => cur = step(cur, n, 1),
-                Key::Space => chosen[cur] = !chosen[cur],
-                Key::Char(b'a') => chosen.fill(true),
-                Key::Char(b'n') => chosen.fill(false),
-                Key::Enter => break Ok((0..n).filter(|&i| chosen[i]).collect::<Vec<_>>()),
-                Key::Esc => break Err(PromptError::Cancel),
-                Key::Interrupt => break Err(PromptError::Abort),
-                Key::Eof => {
-                    self.eof = true;
-                    break Ok((0..n).filter(|&i| chosen[i]).collect::<Vec<_>>());
-                }
-                _ => {}
-            }
-        };
-        let summary = match &result {
-            Ok(idx) => {
-                let labels: Vec<&str> = idx.iter().map(|&i| options[i]).collect();
-                let shown = if labels.is_empty() {
-                    "none".to_string()
-                } else {
-                    labels.join(", ")
-                };
-                chosen_summary(question, &shown)
-            }
-            Err(_) => String::new(),
-        };
-        self.finish_block(n + 2, &summary)?;
-        self.w("\x1b[?25h")?;
-        result
+        let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+        let defaults: Vec<usize> = default_indices(default_selected, opts.len());
+        MultiSelect::new(question, opts)
+            .with_default(&defaults)
+            .with_vim_mode(true)
+            .with_help_message(
+                "\u{2191}\u{2193}/jk move \u{00b7} space toggle \u{00b7} enter confirm \u{00b7} esc back",
+            )
+            .raw_prompt()
+            .map(|sel| sel.into_iter().map(|o| o.index).collect())
+            .map_err(map_err)
     }
 }
 
@@ -779,6 +463,32 @@ mod tests {
     }
 
     #[test]
+    fn secret_default_delegates_to_text() {
+        let (v, _) = run("hunter2\n", |p| p.secret("Password"));
+        assert_eq!(v, "hunter2");
+    }
+
+    #[test]
+    fn map_err_translates_cancel_abort_and_io() {
+        // The wizard's whole cancel-to-go-back / Ctrl-C-quit contract rides on
+        // this mapping; the deleted pty tests were the only prior coverage.
+        assert!(matches!(
+            map_err(InquireError::OperationCanceled),
+            PromptError::Cancel
+        ));
+        assert!(matches!(
+            map_err(InquireError::OperationInterrupted),
+            PromptError::Abort
+        ));
+        assert!(matches!(
+            map_err(InquireError::IO(io::Error::other("boom"))),
+            PromptError::Io(_)
+        ));
+        // Any other inquire error degrades to a plain I/O error, not a cancel.
+        assert!(matches!(map_err(InquireError::NotTTY), PromptError::Io(_)));
+    }
+
+    #[test]
     fn eof_returns_default_and_sets_flag() {
         let mut p = LinePrompt::new(&b""[..], Vec::new());
         assert_eq!(p.text("x", Some("d")).unwrap(), "d");
@@ -788,277 +498,6 @@ mod tests {
         assert_eq!(
             p.multi_select("m", &["a", "b"], &[true, false]).unwrap(),
             vec![0]
-        );
-    }
-
-    #[test]
-    fn decode_key_maps_arrows_vim_controls_and_esc() {
-        assert_eq!(decode_key(b"\x1b[A"), (Key::Up, 3));
-        assert_eq!(decode_key(b"\x1b[B"), (Key::Down, 3));
-        assert_eq!(decode_key(b"\x1bOA"), (Key::Up, 3));
-        assert_eq!(decode_key(b"\r"), (Key::Enter, 1));
-        assert_eq!(decode_key(b" "), (Key::Space, 1));
-        assert_eq!(decode_key(b"j"), (Key::Char(b'j'), 1));
-        assert_eq!(decode_key(&[0x7f]), (Key::Backspace, 1));
-        assert_eq!(decode_key(&[0x03]), (Key::Interrupt, 1));
-        assert_eq!(decode_key(&[0x1b]), (Key::Esc, 1)); // lone ESC
-        assert_eq!(decode_key(b""), (Key::Eof, 0));
-    }
-
-    #[test]
-    fn decode_key_consumes_one_key_from_batched_bytes() {
-        let buf = b"\x1b[B\x1b[B\n";
-        let (k1, n1) = decode_key(buf);
-        assert_eq!((k1, n1), (Key::Down, 3));
-        let (k2, n2) = decode_key(&buf[n1..]);
-        assert_eq!((k2, n2), (Key::Down, 3));
-        let (k3, _) = decode_key(&buf[n1 + n2..]);
-        assert_eq!(k3, Key::Enter);
-    }
-
-    #[test]
-    fn step_wraps_both_directions() {
-        assert_eq!(step(0, 3, -1), 2);
-        assert_eq!(step(2, 3, 1), 0);
-        assert_eq!(step(1, 3, 1), 2);
-        assert_eq!(step(0, 0, 1), 0);
-    }
-
-    #[test]
-    fn pop_utf8_removes_whole_chars() {
-        let mut b = "aé世".as_bytes().to_vec();
-        pop_utf8(&mut b);
-        assert_eq!(b, "aé".as_bytes());
-        pop_utf8(&mut b);
-        assert_eq!(b, b"a");
-        pop_utf8(&mut b);
-        assert!(b.is_empty());
-        pop_utf8(&mut b); // empty is a no-op
-        assert!(b.is_empty());
-    }
-
-    // ----- raw-mode TermUi driven through a real pty -----
-
-    #[cfg(unix)]
-    fn open_pty() -> (RawFd, RawFd) {
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt");
-            assert_eq!(libc::grantpt(master), 0, "grantpt");
-            assert_eq!(libc::unlockpt(master), 0, "unlockpt");
-            let name = libc::ptsname(master);
-            assert!(!name.is_null(), "ptsname");
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave >= 0, "open slave");
-            (master, slave)
-        }
-    }
-
-    /// Put the slave in raw mode up front so the cooked line discipline never
-    /// gets a window to line-buffer input, echo it, or (the subtle one) consume
-    /// a Ctrl-C byte as VINTR before `TermUi` reads it.
-    #[cfg(unix)]
-    fn set_raw(fd: RawFd) {
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(fd, &mut t), 0);
-            t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-            t.c_iflag &= !(libc::IXON | libc::ICRNL);
-            t.c_oflag &= !libc::OPOST;
-            t.c_cc[libc::VMIN] = 1;
-            t.c_cc[libc::VTIME] = 0;
-            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &t), 0);
-        }
-    }
-
-    /// Run `f` against a `TermUi` wired to a pty, feeding `keys` as input.
-    /// The master is drained concurrently so the UI's rendering writes can
-    /// never block on a full pty buffer.
-    #[cfg(unix)]
-    fn drive_term<T: Send + 'static>(
-        keys: &[u8],
-        f: impl FnOnce(&mut TermUi) -> T + Send + 'static,
-    ) -> T {
-        let (master, slave) = open_pty();
-        set_raw(slave);
-        let drain = std::thread::spawn(move || {
-            let mut buf = [0u8; 256];
-            loop {
-                let n =
-                    unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-            }
-        });
-        let handle = std::thread::spawn(move || {
-            let mut ui = TermUi::with_fds(slave, slave);
-            f(&mut ui)
-        });
-        let n = unsafe { libc::write(master, keys.as_ptr() as *const libc::c_void, keys.len()) };
-        assert_eq!(n, keys.len() as isize, "feed keys");
-        let res = handle.join().expect("ui thread");
-        unsafe { libc::close(slave) };
-        drain.join().expect("drain thread");
-        unsafe { libc::close(master) };
-        res
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_select_navigates_with_arrows_over_a_pty() {
-        let res = drive_term(b"\x1b[B\x1b[B\n", |ui| {
-            ui.select("pick", &["a", "b", "c"], 0)
-        });
-        assert_eq!(res.expect("select"), 2);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_select_vim_keys_navigate_over_a_pty() {
-        let res = drive_term(b"jjk\n", |ui| ui.select("pick", &["a", "b", "c"], 0));
-        assert_eq!(res.expect("select"), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_multi_select_toggles_with_space_over_a_pty() {
-        let res = drive_term(b" \x1b[B \n", |ui| {
-            ui.multi_select("e", &["a", "b", "c"], &[false, false, false])
-        });
-        assert_eq!(res.expect("multi_select"), vec![0, 1]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_esc_cancels_and_ctrl_c_aborts_over_a_pty() {
-        // Esc => Cancel (go back).
-        let cancel = drive_term(&[0x1b], |ui| ui.select("pick", &["a", "b"], 0));
-        assert!(matches!(cancel, Err(PromptError::Cancel)));
-        // Ctrl-C => Abort (quit the wizard).
-        let abort = drive_term(&[0x03], |ui| ui.select("pick", &["a", "b"], 0));
-        assert!(matches!(abort, Err(PromptError::Abort)));
-        // Esc cancels a text field too.
-        let text_cancel = drive_term(b"hi\x1b", |ui| ui.text("name", None));
-        assert!(matches!(text_cancel, Err(PromptError::Cancel)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_reassembles_split_escape_sequence() {
-        // ESC arrives alone, then the rest of the arrow sequence within the
-        // timeout: it must navigate (Down -> index 1), not be read as Cancel.
-        let (master, slave) = open_pty();
-        set_raw(slave);
-        let drain = std::thread::spawn(move || {
-            let mut buf = [0u8; 256];
-            while unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
-                > 0
-            {}
-        });
-        let handle = std::thread::spawn(move || {
-            TermUi::with_fds(slave, slave).select("pick", &["a", "b", "c"], 0)
-        });
-        let w = |bytes: &[u8]| {
-            let n =
-                unsafe { libc::write(master, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-            assert_eq!(n, bytes.len() as isize);
-        };
-        w(b"\x1b");
-        std::thread::sleep(std::time::Duration::from_millis(10)); // < ESC_TIMEOUT_MS
-        w(b"[B\n");
-        let res = handle.join().expect("ui thread");
-        unsafe { libc::close(slave) };
-        drain.join().expect("drain");
-        unsafe { libc::close(master) };
-        assert_eq!(
-            res.expect("select"),
-            1,
-            "split arrow must navigate, not cancel"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_text_edits_with_backspace_over_a_pty() {
-        let res = drive_term(b"abc\x7f\x7fX\n", |ui| ui.text("name", Some("def")));
-        assert_eq!(res.expect("text"), "aX");
-        // Blank input falls back to the default.
-        let res = drive_term(b"\n", |ui| ui.text("name", Some("def")));
-        assert_eq!(res.expect("text"), "def");
-    }
-
-    /// Like `drive_term` but also returns everything the UI wrote (the pty
-    /// master output), to assert on what is left on screen.
-    #[cfg(unix)]
-    fn drive_term_capture<T: Send + 'static>(
-        keys: &[u8],
-        f: impl FnOnce(&mut TermUi) -> T + Send + 'static,
-    ) -> (T, Vec<u8>) {
-        use std::sync::{Arc, Mutex};
-        let (master, slave) = open_pty();
-        set_raw(slave);
-        let cap = Arc::new(Mutex::new(Vec::new()));
-        let capc = Arc::clone(&cap);
-        let drain = std::thread::spawn(move || {
-            let mut buf = [0u8; 256];
-            loop {
-                let n =
-                    unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-                capc.lock().unwrap().extend_from_slice(&buf[..n as usize]);
-            }
-        });
-        let handle = std::thread::spawn(move || {
-            let mut ui = TermUi::with_fds(slave, slave);
-            f(&mut ui)
-        });
-        let n = unsafe { libc::write(master, keys.as_ptr() as *const libc::c_void, keys.len()) };
-        assert_eq!(n, keys.len() as isize, "feed keys");
-        let res = handle.join().expect("ui thread");
-        unsafe { libc::close(slave) };
-        drain.join().expect("drain thread");
-        unsafe { libc::close(master) };
-        let bytes = Arc::try_unwrap(cap).unwrap().into_inner().unwrap();
-        (res, bytes)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_select_collapses_menu_to_one_line() {
-        let (res, out) = drive_term_capture(b"\x1b[B\x1b[B\n", |ui| {
-            ui.select("Pick one", &["alpha", "beta", "gamma"], 0)
-        });
-        assert_eq!(res.expect("select"), 2);
-        let s = String::from_utf8_lossy(&out);
-        // The block is erased (clear-to-end-of-display) and replaced by a single
-        // bold summary; the per-option lines no longer linger after it.
-        assert!(s.contains("\x1b[J"), "menu block must be erased:\n{s:?}");
-        assert!(
-            s.contains("Pick one \x1b[1mgamma\x1b[0m"),
-            "collapsed summary must remain:\n{s:?}"
-        );
-        let tail = &s[s.rfind("\x1b[J").unwrap()..];
-        assert!(
-            !tail.contains("alpha") && !tail.contains("beta"),
-            "unchosen options must not survive the collapse:\n{tail:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn term_ui_cancel_erases_the_menu() {
-        let (res, out) =
-            drive_term_capture(&[0x1b], |ui| ui.select("Pick one", &["alpha", "beta"], 0));
-        assert!(matches!(res, Err(PromptError::Cancel)));
-        let s = String::from_utf8_lossy(&out);
-        // After erasing, nothing of the menu is left past the final clear.
-        let tail = &s[s.rfind("\x1b[J").unwrap()..];
-        assert!(
-            !tail.contains("alpha") && !tail.contains("Pick one"),
-            "cancelled menu must be wiped:\n{tail:?}"
         );
     }
 }
