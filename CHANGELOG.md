@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.1.1-alpha.4] - 2026-06-18
+
+- ci: build macos release artifacts
+- deps: Update actions/checkout action to v7 (#10)
+
+
 ## [0.1.1-alpha.3] - 2026-06-18
 
 - chore: require rust 1.96
