@@ -859,15 +859,17 @@ fn events_from_indices(idx: &[usize], names: &[&str]) -> Vec<String> {
 }
 
 /// Build an event list from the multi-select result, then carry through any
-/// already-configured event the menu could not display (e.g. `digest` in
+/// already-configured *valid* event the menu could not display (e.g. `digest` in
 /// `[notify].events`, which the lifecycle menu deliberately omits). Without this,
 /// editing a section would silently drop schema-valid events the user never saw —
 /// the wizard's round trip must stay value-lossless for what the schema models.
+/// Unknown event names (e.g. a typo) are *not* carried through: re-emitting them
+/// would produce a config that `config validate` rejects.
 fn merge_events(idx: &[usize], names: &[&str], prior: Option<&[String]>) -> Vec<String> {
     let mut out = events_from_indices(idx, names);
     if let Some(prior) = prior {
         for e in prior {
-            if !names.contains(&e.as_str()) && !out.contains(e) {
+            if Event::parse(e).is_some() && !names.contains(&e.as_str()) && !out.contains(e) {
                 out.push(e.clone());
             }
         }
@@ -1607,6 +1609,14 @@ n
             merge_events(&[], &names, Some(&prior)),
             vec!["digest".to_string()],
             "an undisplayable event survives even when all menu items are cleared"
+        );
+        // An unknown (typo'd) prior event is dropped, not re-emitted — keeping
+        // it would make the rewritten config fail `config validate`.
+        let typo = vec!["failrue".to_string(), "digest".to_string()];
+        assert_eq!(
+            merge_events(&[1], &names, Some(&typo)),
+            vec!["failure".to_string(), "digest".to_string()],
+            "invalid event names are not carried through"
         );
     }
 
