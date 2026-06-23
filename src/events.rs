@@ -65,12 +65,16 @@ pub fn valid_events() -> String {
 /// kept (SPEC §10 runtime leniency; `validate` treats them as errors).
 pub fn parse_events(list: &[String], warnings: &mut Vec<String>) -> BTreeSet<Event> {
     let mut set = BTreeSet::new();
+    let mut valid: Option<String> = None;
     for s in list {
         match Event::parse(s) {
             Some(e) => {
                 set.insert(e);
             }
-            None => warnings.push(format!("unknown event {s:?} (valid: {})", valid_events())),
+            None => {
+                let valid = valid.get_or_insert_with(valid_events);
+                warnings.push(format!("unknown event {s:?} (valid: {valid})"));
+            }
         }
     }
     set
