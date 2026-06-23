@@ -368,7 +368,8 @@ fn validate_events(list: &[String], where_: &str, errors: &mut Vec<String>) {
     for e in list {
         if Event::parse(e).is_none() {
             errors.push(format!(
-                "{where_}: unknown event {e:?} (valid: success, failure, recovery, stale, long_run, digest)"
+                "{where_}: unknown event {e:?} (valid: {})",
+                events::valid_events()
             ));
         }
     }

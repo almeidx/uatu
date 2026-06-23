@@ -51,6 +51,16 @@ impl Event {
     }
 }
 
+/// Comma-separated list of every valid event name, for `valid: ...`
+/// diagnostics. Derived from [`ALL_EVENTS`] so it never drifts.
+pub fn valid_events() -> String {
+    ALL_EVENTS
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse an events list leniently: unknown names are reported, known ones
 /// kept (SPEC §10 runtime leniency; `validate` treats them as errors).
 pub fn parse_events(list: &[String], warnings: &mut Vec<String>) -> BTreeSet<Event> {
@@ -60,9 +70,7 @@ pub fn parse_events(list: &[String], warnings: &mut Vec<String>) -> BTreeSet<Eve
             Some(e) => {
                 set.insert(e);
             }
-            None => warnings.push(format!(
-                "unknown event {s:?} (valid: success, failure, recovery, stale, long_run, digest)"
-            )),
+            None => warnings.push(format!("unknown event {s:?} (valid: {})", valid_events())),
         }
     }
     set

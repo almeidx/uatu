@@ -19,32 +19,32 @@ use std::time::Duration;
 use crate::commands::maintain::{cmd_notify_test, NotifyTestArgs};
 use crate::config::{
     self, ByteSize, CaptureMode, Config, DigestPeriod, DiscordCfg, Dur, JobCfg, SmtpCfg, SmtpTls,
+    ALL_DIGEST_PERIODS, DEFAULT_EVENTS,
 };
+use crate::events::{Event, ALL_EVENTS};
 use crate::identity::valid_slug;
 use crate::prompt::{self, LinePrompt, PromptError, PromptResult, TermUi, Ui};
 use crate::state;
 use crate::util::{parse_bytes, parse_duration};
 
-/// Lifecycle events that gate routing for the global default and per-job
-/// overrides. `digest` is intentionally absent: digest delivery is controlled
-/// by the `digest` cadence field, not by the job-effective event set
-/// (`reporters_for_digest` in `events.rs`), so offering it here would be inert.
-const EVENT_NAMES: [&str; 5] = ["success", "failure", "recovery", "stale", "long_run"];
+/// Events offered in the global / per-job routing menus: every event except
+/// `digest`. Digest delivery is governed by the `digest` cadence field, not by
+/// the job-effective event set (`reporters_for_digest` in `events.rs`), so
+/// offering it here would be inert.
+fn routing_event_names() -> Vec<&'static str> {
+    ALL_EVENTS
+        .iter()
+        .filter(|&&e| e != Event::Digest)
+        .map(|e| e.as_str())
+        .collect()
+}
 
-/// Events a *reporter* may be restricted to. This list adds `digest`, because a
-/// reporter's own event filter is the one place that can opt a reporter out of
-/// (or into) digest deliveries (`reporter_accepts` / `reporters_for_digest`).
-const REPORTER_EVENT_NAMES: [&str; 6] = [
-    "success", "failure", "recovery", "stale", "long_run", "digest",
-];
-
-/// Digest cadences for the global default (`[notify].digest`).
-const DIGEST_PERIODS: [&str; 5] = ["off", "hourly", "daily", "weekly", "monthly"];
-
-/// Per-job digest override: the global cadences plus a "use global" sentinel
-/// (index 0 → `None`). "off" is a real override that silences a job's digest
-/// even when the global default is on.
-const JOB_DIGEST_OPTS: [&str; 6] = ["use global", "off", "hourly", "daily", "weekly", "monthly"];
+/// Events a reporter's own filter may list — all of them, since a reporter
+/// filter is the one place `digest` is a meaningful opt-in / opt-out
+/// (`reporter_accepts` / `reporters_for_digest`).
+fn reporter_event_names() -> Vec<&'static str> {
+    ALL_EVENTS.iter().map(|e| e.as_str()).collect()
+}
 
 pub struct ConfigureArgs {
     /// Explicit target path (`--config` for `config wizard`, `--path` for
@@ -405,20 +405,17 @@ fn ask_event_restriction<U: Ui>(
     if !restrict {
         return Ok(None);
     }
-    let defaults = event_defaults(
-        current.as_deref(),
-        &REPORTER_EVENT_NAMES,
-        &REPORTER_EVENT_NAMES,
-    );
+    let names = reporter_event_names();
+    let defaults = event_defaults(current.as_deref(), &names, &names);
     let idx = p.multi_select(
         "Events for this reporter (include digest to receive periodic summaries):",
-        &REPORTER_EVENT_NAMES,
+        &names,
         &defaults,
     )?;
     if idx.is_empty() {
         p.say("  ! note: no events selected — this reporter will stay silent until you add some")?;
     }
-    Ok(Some(events_from_indices(&idx, &REPORTER_EVENT_NAMES)))
+    Ok(Some(events_from_indices(&idx, &names)))
 }
 
 fn enable_global_reporter(cfg: &mut Config, full_name: &str) {
@@ -433,17 +430,10 @@ fn enable_global_reporter(cfg: &mut Config, full_name: &str) {
 fn configure_notify<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
     // Collect every answer first; only commit once the section completes, so an
     // Esc partway through discards the whole edit.
-    let defaults = event_defaults(
-        cfg.notify.events.as_deref(),
-        &["success", "failure"],
-        &EVENT_NAMES,
-    );
-    let idx = p.multi_select(
-        "Alert on which events (global default)?",
-        &EVENT_NAMES,
-        &defaults,
-    )?;
-    let events = merge_events(&idx, &EVENT_NAMES, cfg.notify.events.as_deref());
+    let names = routing_event_names();
+    let defaults = event_defaults(cfg.notify.events.as_deref(), &DEFAULT_EVENTS, &names);
+    let idx = p.multi_select("Alert on which events (global default)?", &names, &defaults)?;
+    let events = merge_events(&idx, &names, cfg.notify.events.as_deref());
 
     let all = reporter_names(cfg);
     let reporters = if all.is_empty() {
@@ -547,9 +537,10 @@ fn configure_job<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
         "Restrict this job to specific events? (No = use global)",
         job.events.is_some(),
     )? {
-        let defaults = event_defaults(job.events.as_deref(), &EVENT_NAMES, &EVENT_NAMES);
-        let idx = p.multi_select("Events for this job:", &EVENT_NAMES, &defaults)?;
-        let events = merge_events(&idx, &EVENT_NAMES, job.events.as_deref());
+        let names = routing_event_names();
+        let defaults = event_defaults(job.events.as_deref(), &names, &names);
+        let idx = p.multi_select("Events for this job:", &names, &defaults)?;
+        let events = merge_events(&idx, &names, job.events.as_deref());
         job.events = Some(events);
     }
 
@@ -924,55 +915,47 @@ fn parse_smtp_tls(s: &str) -> SmtpTls {
     }
 }
 
-fn parse_digest_period(s: &str) -> DigestPeriod {
-    match s {
-        "hourly" => DigestPeriod::Hourly,
-        "daily" => DigestPeriod::Daily,
-        "weekly" => DigestPeriod::Weekly,
-        "monthly" => DigestPeriod::Monthly,
-        _ => DigestPeriod::Off,
-    }
-}
-
 /// Global digest cadence (`[notify].digest`). "off" is the schema default, so it
 /// is stored as `None` (an absent key) rather than an explicit `digest = "off"`.
 fn ask_global_digest<U: Ui>(
     p: &mut U,
     current: Option<DigestPeriod>,
 ) -> PromptResult<Option<DigestPeriod>> {
-    let cur = current.unwrap_or(DigestPeriod::Off).as_str();
-    let di = DIGEST_PERIODS.iter().position(|o| *o == cur).unwrap_or(0);
-    let sel = p.select(
-        "Periodic digest of job runs (global default)?",
-        &DIGEST_PERIODS,
-        di,
-    )?;
-    let period = parse_digest_period(DIGEST_PERIODS[sel]);
+    let names: Vec<&str> = ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()).collect();
+    let cur = current.unwrap_or(DigestPeriod::Off);
+    let di = ALL_DIGEST_PERIODS
+        .iter()
+        .position(|d| *d == cur)
+        .unwrap_or(0);
+    let sel = p.select("Periodic digest of job runs (global default)?", &names, di)?;
+    let period = ALL_DIGEST_PERIODS[sel];
     Ok((period != DigestPeriod::Off).then_some(period))
 }
 
-/// Per-job digest override. Index 0 ("use global") clears the override so the
+/// Per-job digest override. Option 0 ("use global") clears the override so the
 /// job inherits `[notify].digest`; any other choice — including "off" — is a
 /// real per-job override.
 fn ask_job_digest<U: Ui>(
     p: &mut U,
     current: Option<DigestPeriod>,
 ) -> PromptResult<Option<DigestPeriod>> {
+    let mut names = vec!["use global"];
+    names.extend(ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()));
     let di = match current {
         None => 0,
-        Some(period) => JOB_DIGEST_OPTS
+        Some(cur) => ALL_DIGEST_PERIODS
             .iter()
-            .position(|o| *o == period.as_str())
-            .unwrap_or(0),
+            .position(|d| *d == cur)
+            .map_or(0, |i| i + 1),
     };
     let sel = p.select(
         "Digest cadence for this job? (use global = inherit)",
-        &JOB_DIGEST_OPTS,
+        &names,
         di,
     )?;
     Ok(match sel {
         0 => None,
-        n => Some(parse_digest_period(JOB_DIGEST_OPTS[n])),
+        n => Some(ALL_DIGEST_PERIODS[n - 1]),
     })
 }
 
@@ -1612,15 +1595,16 @@ n
 
     #[test]
     fn merge_events_carries_through_undisplayable_events() {
-        // The lifecycle menu (EVENT_NAMES) cannot show `digest`; a prior config
-        // that listed it must keep it rather than have it silently dropped.
+        // The routing menu (routing_event_names) cannot show `digest`; a prior
+        // config that listed it must keep it rather than have it silently dropped.
+        let names = routing_event_names();
         let prior = vec!["success".to_string(), "digest".to_string()];
-        let merged = merge_events(&[1], &EVENT_NAMES, Some(&prior));
+        let merged = merge_events(&[1], &names, Some(&prior));
         assert_eq!(merged, vec!["failure".to_string(), "digest".to_string()]);
         // No prior, no carry-through; deselecting a displayable event drops it.
-        assert_eq!(merge_events(&[0], &EVENT_NAMES, None), vec!["success"]);
+        assert_eq!(merge_events(&[0], &names, None), vec!["success"]);
         assert_eq!(
-            merge_events(&[], &EVENT_NAMES, Some(&prior)),
+            merge_events(&[], &names, Some(&prior)),
             vec!["digest".to_string()],
             "an undisplayable event survives even when all menu items are cleared"
         );
