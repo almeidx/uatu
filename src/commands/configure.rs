@@ -18,14 +18,33 @@ use std::time::Duration;
 
 use crate::commands::maintain::{cmd_notify_test, NotifyTestArgs};
 use crate::config::{
-    self, ByteSize, CaptureMode, Config, DiscordCfg, Dur, JobCfg, SmtpCfg, SmtpTls,
+    self, ByteSize, CaptureMode, Config, DigestPeriod, DiscordCfg, Dur, JobCfg, SmtpCfg, SmtpTls,
+    ALL_DIGEST_PERIODS, DEFAULT_EVENTS,
 };
+use crate::events::{Event, ALL_EVENTS};
 use crate::identity::valid_slug;
 use crate::prompt::{self, LinePrompt, PromptError, PromptResult, TermUi, Ui};
 use crate::state;
 use crate::util::{parse_bytes, parse_duration};
 
-const EVENT_NAMES: [&str; 5] = ["success", "failure", "recovery", "stale", "long_run"];
+/// Events offered in the global / per-job routing menus: every event except
+/// `digest`. Digest delivery is governed by the `digest` cadence field, not by
+/// the job-effective event set (`reporters_for_digest` in `events.rs`), so
+/// offering it here would be inert.
+fn routing_event_names() -> Vec<&'static str> {
+    ALL_EVENTS
+        .iter()
+        .filter(|&&e| e != Event::Digest)
+        .map(|e| e.as_str())
+        .collect()
+}
+
+/// Events a reporter's own filter may list — all of them, since a reporter
+/// filter is the one place `digest` is a meaningful opt-in / opt-out
+/// (`reporter_accepts` / `reporters_for_digest`).
+fn reporter_event_names() -> Vec<&'static str> {
+    ALL_EVENTS.iter().map(|e| e.as_str()).collect()
+}
 
 pub struct ConfigureArgs {
     /// Explicit target path (`--config` for `config wizard`, `--path` for
@@ -386,12 +405,17 @@ fn ask_event_restriction<U: Ui>(
     if !restrict {
         return Ok(None);
     }
-    let defaults = event_defaults(current.as_deref(), &EVENT_NAMES);
-    let idx = p.multi_select("Events for this reporter:", &EVENT_NAMES, &defaults)?;
+    let names = reporter_event_names();
+    let defaults = event_defaults(current.as_deref(), &names, &names);
+    let idx = p.multi_select(
+        "Events for this reporter (include digest to receive periodic summaries):",
+        &names,
+        &defaults,
+    )?;
     if idx.is_empty() {
         p.say("  ! note: no events selected — this reporter will stay silent until you add some")?;
     }
-    Ok(Some(events_from_indices(&idx)))
+    Ok(Some(events_from_indices(&idx, &names)))
 }
 
 fn enable_global_reporter(cfg: &mut Config, full_name: &str) {
@@ -406,13 +430,10 @@ fn enable_global_reporter(cfg: &mut Config, full_name: &str) {
 fn configure_notify<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
     // Collect every answer first; only commit once the section completes, so an
     // Esc partway through discards the whole edit.
-    let defaults = event_defaults(cfg.notify.events.as_deref(), &["success", "failure"]);
-    let idx = p.multi_select(
-        "Alert on which events (global default)?",
-        &EVENT_NAMES,
-        &defaults,
-    )?;
-    let events = events_from_indices(&idx);
+    let names = routing_event_names();
+    let defaults = event_defaults(cfg.notify.events.as_deref(), &DEFAULT_EVENTS, &names);
+    let idx = p.multi_select("Alert on which events (global default)?", &names, &defaults)?;
+    let events = merge_events(&idx, &names, cfg.notify.events.as_deref());
 
     let all = reporter_names(cfg);
     let reporters = if all.is_empty() {
@@ -437,12 +458,14 @@ fn configure_notify<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
         "Include redacted output tails on failure alerts?",
         cfg.notify.failure_output.unwrap_or(true),
     )?;
+    let digest = ask_global_digest(p, cfg.notify.digest)?;
 
     cfg.notify.events = Some(events);
     if let Some(reporters) = reporters {
         cfg.notify.reporters = Some(reporters);
     }
     cfg.notify.failure_output = Some(fo);
+    cfg.notify.digest = digest;
     Ok(())
 }
 
@@ -514,10 +537,14 @@ fn configure_job<U: Ui>(cfg: &mut Config, p: &mut U) -> PromptResult<()> {
         "Restrict this job to specific events? (No = use global)",
         job.events.is_some(),
     )? {
-        let defaults = event_defaults(job.events.as_deref(), &EVENT_NAMES);
-        let idx = p.multi_select("Events for this job:", &EVENT_NAMES, &defaults)?;
-        job.events = Some(events_from_indices(&idx));
+        let names = routing_event_names();
+        let defaults = event_defaults(job.events.as_deref(), &names, &names);
+        let idx = p.multi_select("Events for this job:", &names, &defaults)?;
+        let events = merge_events(&idx, &names, job.events.as_deref());
+        job.events = Some(events);
     }
+
+    job.digest = ask_job_digest(p, job.digest)?;
 
     if p.confirm(
         "Set environment variables for this job?",
@@ -570,6 +597,7 @@ fn job_has_fields(j: &JobCfg) -> bool {
         || j.capture_tail_bytes.is_some()
         || j.kill_grace.is_some()
         || j.failure_output.is_some()
+        || j.digest.is_some()
 }
 
 /// Prompt for a brand-new job name. `None` means the user cancelled (blank or
@@ -815,23 +843,38 @@ fn reporter_names(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-fn event_defaults(current: Option<&[String]>, fallback: &[&str]) -> [bool; 5] {
+fn event_defaults(current: Option<&[String]>, fallback: &[&str], names: &[&str]) -> Vec<bool> {
     let active: Vec<&str> = match current {
         Some(list) => list.iter().map(|s| s.as_str()).collect(),
         None => fallback.to_vec(),
     };
-    let mut d = [false; 5];
-    for (i, name) in EVENT_NAMES.iter().enumerate() {
-        d[i] = active.contains(name);
-    }
-    d
+    names.iter().map(|name| active.contains(name)).collect()
 }
 
-fn events_from_indices(idx: &[usize]) -> Vec<String> {
+fn events_from_indices(idx: &[usize], names: &[&str]) -> Vec<String> {
     idx.iter()
-        .filter_map(|&i| EVENT_NAMES.get(i))
+        .filter_map(|&i| names.get(i))
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Build an event list from the multi-select result, then carry through any
+/// already-configured *valid* event the menu could not display (e.g. `digest` in
+/// `[notify].events`, which the lifecycle menu deliberately omits). Without this,
+/// editing a section would silently drop schema-valid events the user never saw —
+/// the wizard's round trip must stay value-lossless for what the schema models.
+/// Unknown event names (e.g. a typo) are *not* carried through: re-emitting them
+/// would produce a config that `config validate` rejects.
+fn merge_events(idx: &[usize], names: &[&str], prior: Option<&[String]>) -> Vec<String> {
+    let mut out = events_from_indices(idx, names);
+    if let Some(prior) = prior {
+        for e in prior {
+            if Event::parse(e).is_some() && !names.contains(&e.as_str()) && !out.contains(e) {
+                out.push(e.clone());
+            }
+        }
+    }
+    out
 }
 
 fn is_env_name(k: &str) -> bool {
@@ -872,6 +915,50 @@ fn parse_smtp_tls(s: &str) -> SmtpTls {
         "none" => SmtpTls::None,
         _ => SmtpTls::Starttls,
     }
+}
+
+/// Global digest cadence (`[notify].digest`). "off" is the schema default, so it
+/// is stored as `None` (an absent key) rather than an explicit `digest = "off"`.
+fn ask_global_digest<U: Ui>(
+    p: &mut U,
+    current: Option<DigestPeriod>,
+) -> PromptResult<Option<DigestPeriod>> {
+    let names: Vec<&str> = ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()).collect();
+    let cur = current.unwrap_or(DigestPeriod::Off);
+    let di = ALL_DIGEST_PERIODS
+        .iter()
+        .position(|d| *d == cur)
+        .unwrap_or(0);
+    let sel = p.select("Periodic digest of job runs (global default)?", &names, di)?;
+    let period = ALL_DIGEST_PERIODS[sel];
+    Ok((period != DigestPeriod::Off).then_some(period))
+}
+
+/// Per-job digest override. Option 0 ("use global") clears the override so the
+/// job inherits `[notify].digest`; any other choice — including "off" — is a
+/// real per-job override.
+fn ask_job_digest<U: Ui>(
+    p: &mut U,
+    current: Option<DigestPeriod>,
+) -> PromptResult<Option<DigestPeriod>> {
+    let mut names = vec!["use global"];
+    names.extend(ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()));
+    let di = match current {
+        None => 0,
+        Some(cur) => ALL_DIGEST_PERIODS
+            .iter()
+            .position(|d| *d == cur)
+            .map_or(0, |i| i + 1),
+    };
+    let sel = p.select(
+        "Digest cadence for this job? (use global = inherit)",
+        &names,
+        di,
+    )?;
+    Ok(match sel {
+        0 => None,
+        n => Some(ALL_DIGEST_PERIODS[n - 1]),
+    })
 }
 
 fn backup_path(target: &Path) -> PathBuf {
@@ -1066,6 +1153,9 @@ pub fn render_config(cfg: &Config) -> String {
     if let Some(v) = n.failure_output {
         lines.push(format!("failure_output = {v}"));
     }
+    if let Some(v) = n.digest {
+        lines.push(format!("digest = {}", toml_str(v.as_str())));
+    }
     push_table(&mut o, "notify", &lines);
 
     for (name, d) in &cfg.discord {
@@ -1175,6 +1265,9 @@ pub fn render_config(cfg: &Config) -> String {
         if let Some(v) = j.failure_output {
             lines.push(format!("failure_output = {v}"));
         }
+        if let Some(v) = j.digest {
+            lines.push(format!("digest = {}", toml_str(v.as_str())));
+        }
         push_table(&mut o, &format!("jobs.{}", toml_key(name)), &lines);
     }
 
@@ -1278,6 +1371,7 @@ mod tests {
         cfg.notify.events = Some(vec!["failure".into(), "recovery".into()]);
         cfg.notify.reporters = Some(vec!["discord.default".into(), "smtp.ops".into()]);
         cfg.notify.failure_output = Some(true);
+        cfg.notify.digest = Some(DigestPeriod::Daily);
         cfg.discord.insert(
             "default".into(),
             DiscordCfg {
@@ -1312,6 +1406,7 @@ mod tests {
                 schedule_label: Some("nightly at 02:00".into()),
                 reporters: Some(vec!["discord.default".into()]),
                 events: Some(vec!["failure".into(), "recovery".into()]),
+                digest: Some(DigestPeriod::Weekly),
                 ..Default::default()
             },
         );
@@ -1337,6 +1432,7 @@ mod tests {
             parsed.notify.events,
             Some(vec!["failure".into(), "recovery".into()])
         );
+        assert_eq!(parsed.notify.digest, Some(DigestPeriod::Daily));
         let d = parsed.discord.get("default").unwrap();
         assert_eq!(d.webhook_url, "https://discord.com/api/webhooks/1/\"abc\"");
         assert_eq!(d.max_message_chars, Some(3500));
@@ -1347,6 +1443,7 @@ mod tests {
         assert_eq!(j.cwd.as_deref(), Some("/srv/app"));
         assert_eq!(j.env.get("RUST_LOG").map(String::as_str), Some("info"));
         assert_eq!(j.timeout.map(|d| d.0), Some(Duration::from_secs(7200)));
+        assert_eq!(j.digest, Some(DigestPeriod::Weekly));
     }
 
     #[test]
@@ -1375,8 +1472,9 @@ mod tests {
     fn wizard_adds_discord_sets_routing_and_job() {
         // 1=reporters; 1=discord, name(default), url, no-restrict, 3=done.
         // 2=notify routing (events default, reporters default, failure_output
-        // default). 3=job "nightly" with a schedule label (so it is recorded),
-        // remaining fields blank, no restrictions, no env. 6=save. test? no.
+        // default, digest default=off). 3=job "nightly" with a schedule label
+        // (so it is recorded), remaining fields blank, no restrictions, digest
+        // default=use-global, no env. 6=save. test? no.
         let script = "\
 1
 1
@@ -1388,6 +1486,7 @@ n
 
 
 
+
 3
 nightly
 nightly at 2
@@ -1396,6 +1495,7 @@ nightly at 2
 
 n
 n
+
 n
 6
 n
@@ -1435,10 +1535,131 @@ n
     }
 
     #[test]
+    fn wizard_sets_digest_cadence_and_reporter_digest_event() {
+        // 1=reporters; discord "dft"; restrict events to failure(2) + digest(6)
+        // so a restricted reporter still receives digests; 3=done.
+        // 2=notify: events/reporters/failure_output defaults, then digest=daily
+        // (option 3 of off|hourly|daily|weekly|monthly).
+        // 3=job "backup": all blank, no restrictions, digest=weekly (option 5 of
+        // use-global|off|hourly|daily|weekly|monthly), no env. 6=save; no test.
+        let script = "\
+1
+1
+dft
+https://discord.com/api/webhooks/1/abc
+y
+2,6
+3
+2
+
+
+
+3
+3
+backup
+
+
+
+
+n
+n
+5
+n
+6
+n
+";
+        let (cfg, _) = drive(script);
+        assert_eq!(
+            cfg.discord["dft"].events,
+            Some(vec!["failure".to_string(), "digest".to_string()]),
+            "a restricted reporter can opt into digest deliveries"
+        );
+        assert_eq!(
+            cfg.notify.digest,
+            Some(DigestPeriod::Daily),
+            "global digest cadence is set"
+        );
+        assert_eq!(
+            cfg.jobs.get("backup").and_then(|j| j.digest),
+            Some(DigestPeriod::Weekly),
+            "per-job digest override is set"
+        );
+
+        let (parsed, warnings, redaction_invalid) = reparse(&render_config(&cfg));
+        assert_eq!(warnings, Vec::<String>::new());
+        assert!(redaction_invalid.is_none());
+        assert_eq!(parsed.notify.digest, Some(DigestPeriod::Daily));
+        assert_eq!(
+            parsed.jobs.get("backup").and_then(|j| j.digest),
+            Some(DigestPeriod::Weekly)
+        );
+    }
+
+    #[test]
+    fn merge_events_carries_through_undisplayable_events() {
+        // The routing menu (routing_event_names) cannot show `digest`; a prior
+        // config that listed it must keep it rather than have it silently dropped.
+        let names = routing_event_names();
+        let prior = vec!["success".to_string(), "digest".to_string()];
+        let merged = merge_events(&[1], &names, Some(&prior));
+        assert_eq!(merged, vec!["failure".to_string(), "digest".to_string()]);
+        // No prior, no carry-through; deselecting a displayable event drops it.
+        assert_eq!(merge_events(&[0], &names, None), vec!["success"]);
+        assert_eq!(
+            merge_events(&[], &names, Some(&prior)),
+            vec!["digest".to_string()],
+            "an undisplayable event survives even when all menu items are cleared"
+        );
+        // An unknown (typo'd) prior event is dropped, not re-emitted — keeping
+        // it would make the rewritten config fail `config validate`.
+        let typo = vec!["failrue".to_string(), "digest".to_string()];
+        assert_eq!(
+            merge_events(&[1], &names, Some(&typo)),
+            vec!["failure".to_string(), "digest".to_string()],
+            "invalid event names are not carried through"
+        );
+    }
+
+    #[test]
+    fn wizard_preserves_digest_in_event_arrays_on_edit() {
+        // A config that already lists `digest` in [notify].events and a job's
+        // events (valid but inert there) must not lose it when the user walks
+        // those sections accepting defaults.
+        let mut cfg = Config::default();
+        cfg.notify.events = Some(vec!["success".into(), "failure".into(), "digest".into()]);
+        cfg.jobs.insert(
+            "web".into(),
+            JobCfg {
+                events: Some(vec!["failure".into(), "digest".into()]),
+                ..Default::default()
+            },
+        );
+        // 2=notify: accept events / failure_output / digest-cadence defaults (no
+        // reporters, so the reporter multi-select is skipped). 3=job: select
+        // "web"(1); keep schedule/cwd/timeout/expected; accept the (defaulted-on)
+        // event restriction and its default selection; use-global digest; no env.
+        // 6=save.
+        let script = "2\n\n\n\n3\n1\n\n\n\n\n\n\n\n\n6\n";
+        let mut p = LinePrompt::new(script.as_bytes(), Vec::new());
+        run_wizard(&mut cfg, &mut p).expect("wizard");
+        assert_eq!(
+            cfg.notify.events,
+            Some(vec!["success".into(), "failure".into(), "digest".into()]),
+            "digest in [notify].events survives an edit"
+        );
+        assert_eq!(
+            cfg.jobs.get("web").and_then(|j| j.events.clone()),
+            Some(vec!["failure".into(), "digest".into()]),
+            "digest in a job's events survives an edit"
+        );
+    }
+
+    #[test]
     fn wizard_does_not_record_an_empty_job() {
         // 3=job, name "emptyjob", every field blank/declined; no reporters
-        // exist so the reporter-restriction question is skipped. 6=save.
-        let script = "3\nemptyjob\n\n\n\n\nn\nn\n6\n";
+        // exist so the reporter-restriction question is skipped; digest left at
+        // the use-global default. 6=save.
+        let script = "3\nemptyjob\n\n\n\n\nn\n\nn\n6\n";
         let (cfg, _) = drive(script);
         assert!(
             !cfg.jobs.contains_key("emptyjob"),
@@ -1459,8 +1680,9 @@ n
             },
         );
         // 3=job; select 1 (the existing "web"); keep schedule; blank cwd/timeout/
-        // expected; decline event restriction and env; 6=save.
-        let script = "3\n1\n\n\n\n\nn\nn\n6\n";
+        // expected; decline event restriction; digest use-global; decline env;
+        // 6=save.
+        let script = "3\n1\n\n\n\n\nn\n\nn\n6\n";
         let mut p = LinePrompt::new(script.as_bytes(), Vec::new());
         run_wizard(&mut cfg, &mut p).expect("wizard");
         assert_eq!(
@@ -1483,8 +1705,9 @@ n
             },
         );
         // 3=job; select 2 ("+ Add a new job"); name "api"; schedule "nightly";
-        // blank cwd/timeout/expected; decline restrictions and env; 6=save.
-        let script = "3\n2\napi\nnightly\n\n\n\nn\nn\n6\n";
+        // blank cwd/timeout/expected; decline restrictions; digest use-global;
+        // decline env; 6=save.
+        let script = "3\n2\napi\nnightly\n\n\n\nn\n\nn\n6\n";
         let mut p = LinePrompt::new(script.as_bytes(), Vec::new());
         run_wizard(&mut cfg, &mut p).expect("wizard");
         assert!(cfg.jobs.contains_key("web"), "existing job is preserved");

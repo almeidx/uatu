@@ -365,11 +365,11 @@ pub fn cmd_validate(args: ValidateArgs) -> i32 {
 }
 
 fn validate_events(list: &[String], where_: &str, errors: &mut Vec<String>) {
+    let mut valid: Option<String> = None;
     for e in list {
         if Event::parse(e).is_none() {
-            errors.push(format!(
-                "{where_}: unknown event {e:?} (valid: success, failure, recovery, stale, long_run, digest)"
-            ));
+            let valid = valid.get_or_insert_with(events::valid_events);
+            errors.push(format!("{where_}: unknown event {e:?} (valid: {valid})"));
         }
     }
 }

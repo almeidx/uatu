@@ -65,6 +65,14 @@ pub enum DigestPeriod {
     Monthly,
 }
 
+pub const ALL_DIGEST_PERIODS: [DigestPeriod; 5] = [
+    DigestPeriod::Off,
+    DigestPeriod::Hourly,
+    DigestPeriod::Daily,
+    DigestPeriod::Weekly,
+    DigestPeriod::Monthly,
+];
+
 impl DigestPeriod {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -73,6 +81,19 @@ impl DigestPeriod {
             DigestPeriod::Daily => "daily",
             DigestPeriod::Weekly => "weekly",
             DigestPeriod::Monthly => "monthly",
+        }
+    }
+
+    /// Parse a digest period; accepts `none`/`disabled` as aliases for `off`.
+    /// `None` for anything else. The canonical names are in [`ALL_DIGEST_PERIODS`].
+    pub fn parse(s: &str) -> Option<DigestPeriod> {
+        match s {
+            "off" | "none" | "disabled" => Some(DigestPeriod::Off),
+            "hourly" => Some(DigestPeriod::Hourly),
+            "daily" => Some(DigestPeriod::Daily),
+            "weekly" => Some(DigestPeriod::Weekly),
+            "monthly" => Some(DigestPeriod::Monthly),
+            _ => None,
         }
     }
 
@@ -114,16 +135,14 @@ impl DigestPeriod {
 impl<'de> Deserialize<'de> for DigestPeriod {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        match s.as_str() {
-            "off" | "none" | "disabled" => Ok(DigestPeriod::Off),
-            "hourly" => Ok(DigestPeriod::Hourly),
-            "daily" => Ok(DigestPeriod::Daily),
-            "weekly" => Ok(DigestPeriod::Weekly),
-            "monthly" => Ok(DigestPeriod::Monthly),
-            _ => Err(serde::de::Error::custom(
-                "invalid digest period (valid: off, hourly, daily, weekly, monthly)",
-            )),
-        }
+        DigestPeriod::parse(&s).ok_or_else(|| {
+            let valid = ALL_DIGEST_PERIODS
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            serde::de::Error::custom(format!("invalid digest period (valid: {valid})"))
+        })
     }
 }
 
