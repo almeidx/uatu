@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.1.1-alpha.5] - 2026-06-23
+
+- feat(config): cover digest options in the interactive wizard (#14)
+- deps: Update patch/minor dependencies to 0.2.29 (#13)
+- deps: Lock file maintenance (#12)
+- docs: prefer homebrew install
+
+
 ## [0.1.1-alpha.4] - 2026-06-18
 
 - ci: build macos release artifacts

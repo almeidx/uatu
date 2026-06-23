@@ -1,6 +1,6 @@
 [package]
 name = "uatu"
-version = "0.1.1-alpha.4"
+version = "0.1.1-alpha.5"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
