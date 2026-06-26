@@ -10,7 +10,7 @@ keywords = ["cron", "monitoring", "observability", "cli"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm", "fuzzy"] }
 jiff = "0.2.29"
