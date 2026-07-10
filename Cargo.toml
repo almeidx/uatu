@@ -13,7 +13,7 @@ categories = ["command-line-utilities"]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm", "fuzzy"] }
-jiff = "0.2.31"
+jiff = "0.2.32"
 lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 libc = "0.2.186"
 rand = "0.10.2"
