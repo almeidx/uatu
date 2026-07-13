@@ -26,7 +26,7 @@ sha2 = "0.11.0"
 signal-hook = "0.4.4"
 tokio = { version = "1.52.3", features = ["rt", "time"] }
 toml = "1.1.2"
-ulid = "1.2.1"
+ulid = "2.0.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

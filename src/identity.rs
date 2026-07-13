@@ -82,7 +82,7 @@ fn sanitize_basename(raw: &str) -> String {
 }
 
 pub fn new_run_id() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::gen().to_string()
 }
 
 #[cfg(test)]
