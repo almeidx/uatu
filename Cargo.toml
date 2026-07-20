@@ -13,14 +13,14 @@ categories = ["command-line-utilities"]
 anyhow = "1.0.104"
 clap = { version = "4.6.2", features = ["derive"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm", "fuzzy"] }
-jiff = "0.2.32"
+jiff = "0.2.33"
 lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 libc = "0.2.186"
 rand = "0.10.2"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 signal-hook = "0.4.4"
