@@ -128,15 +128,18 @@ const SAMPLE_CONFIG: &str = r#"# uatu configuration — https://github.com/almei
 # regex = ['''password=[^[:space:]]+''']
 
 [notify]
-# events = ["success", "failure"]     # valid: success, failure, recovery, stale, long_run, digest
+# events = ["success", "failure"]     # immediate alerts: success, failure, recovery, stale, long_run
 # reporters = ["discord.default", "smtp.ops"]
 # failure_output = true               # include redacted output tails on failure
-# digest = "off"                      # off | hourly | daily | weekly | monthly
+# digest = "off"                      # aggregate observed executions; off | hourly | daily | weekly | monthly
+# One aggregate is sent per eligible reporter, local host, cadence, and UTC window.
+# Only reporter-level events filters can exclude digest delivery.
+# Contents are observed jobs/executions, not a crontab inventory or missed-run report.
 
 # [reporters.discord.default]
 # webhook_url = "https://discord.com/api/webhooks/..."
 # max_message_chars = 3500
-# events = ["success", "failure", "recovery", "stale", "long_run", "digest"]
+# events = ["success", "failure", "recovery", "stale", "long_run", "digest"] # include digest here
 
 # [reporters.smtp.ops]
 # host = "smtp.example.com"
@@ -155,8 +158,8 @@ const SAMPLE_CONFIG: &str = r#"# uatu configuration — https://github.com/almei
 # expected_duration = "45m"           # one long_run alert when exceeded
 # schedule_label = "nightly at 02:00" # display only
 # reporters = ["discord.default"]
-# events = ["failure", "recovery"]    # the quiet profile for frequent jobs
-# digest = "daily"                    # periodic total/status summary for this job
+# events = ["failure", "recovery"]    # immediate-alert quiet profile
+# digest = "daily"                    # joins that cadence; off excludes; another cadence is another cohort
 
 # Run `uatu config validate` after every edit.
 # Run `uatu notify test` after configuring reporters.
@@ -294,6 +297,7 @@ pub fn cmd_validate(args: ValidateArgs) -> i32 {
     }
     if let Some(ev) = &cfg.notify.events {
         validate_events(ev, "notify", &mut errors);
+        warn_inert_digest_event(ev, "notify", &mut warnings);
     }
     for (job, j) in &cfg.jobs {
         if !crate::identity::valid_slug(job) {
@@ -312,6 +316,7 @@ pub fn cmd_validate(args: ValidateArgs) -> i32 {
         }
         if let Some(ev) = &j.events {
             validate_events(ev, &format!("jobs.{job}"), &mut errors);
+            warn_inert_digest_event(ev, &format!("jobs.{job}"), &mut warnings);
         }
         // expected_duration > timeout is almost certainly a mistake (SPEC §3).
         if let (Some(exp), Some(timeout)) = (j.expected_duration, j.timeout) {
@@ -371,6 +376,14 @@ fn validate_events(list: &[String], where_: &str, errors: &mut Vec<String>) {
             let valid = valid.get_or_insert_with(events::valid_events);
             errors.push(format!("{where_}: unknown event {e:?} (valid: {valid})"));
         }
+    }
+}
+
+fn warn_inert_digest_event(list: &[String], table: &str, warnings: &mut Vec<String>) {
+    if list.iter().any(|event| event == Event::Digest.as_str()) {
+        warnings.push(format!(
+            "[{table}].events includes \"digest\", but it has no effect there; cadence comes from [notify].digest/[jobs.*].digest, and only [reporters.*].events can filter digest delivery"
+        ));
     }
 }
 

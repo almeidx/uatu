@@ -165,11 +165,15 @@ observed, and warns when `expected_duration` exceeds `timeout`.
 
 ### Events and reporters
 
-Events: `success`, `failure`, `recovery`, `stale`, `long_run`, `digest`.
+Immediate events are `success`, `failure`, `recovery`, `stale`, and `long_run`.
 Default: `["success", "failure"]`. Per-reporter `events` filters intersect
 with the job-effective set — "Discord gets everything, email only failures"
-needs no routing matrix. `digest` is controlled by the `digest` period setting
-below and can be included in per-reporter filters:
+needs no routing matrix.
+
+`digest` is special: its cadence comes only from `[notify].digest` and per-job
+`digest` overrides. Putting `digest` in `[notify].events` or
+`[jobs.<name>].events` has no effect (`config validate` warns about it). Only a
+reporter's own `events` filter may opt that reporter in or out of digests:
 
 ```toml
 [notify]
@@ -185,7 +189,7 @@ host = "smtp.example.com"
 tls = "starttls"            # "starttls" | "smtps" | "none" (explicit, localhost only)
 from = "uatu@example.com"
 recipients = ["ops@example.com"]
-events = ["failure", "recovery", "stale"]   # email only wakes people for problems
+events = ["failure", "recovery", "stale"]   # no digest for this reporter
 ```
 
 > [!TIP]
@@ -204,13 +208,34 @@ digest = "hourly"
 
 [jobs.frequent-health-check]
 events = ["failure", "recovery"]
-digest = "daily"         # overrides the global digest for this job
+digest = "daily"         # a separate daily aggregate cohort
+
+[jobs.no-summary]
+digest = "off"           # exclude this job from aggregates
 ```
 
-Digests are grouped by job, reporter, and UTC window, and include total runs,
-status counts, and duration stats for that job. They are sent by the first
-`run`/`flush` after the window closes; failures, recoveries, stale, and
-long-run alerts are still delivered immediately.
+Each digest is one aggregate message per eligible reporter, local host,
+effective cadence, and UTC window. Jobs with the same effective cadence are
+listed together; a per-job `off` override excludes that job, while another
+cadence places it in another aggregate cohort. Aggregates include observed
+jobs and executions, status counts, and duration statistics. They are sent by
+the first `run`/`flush` after the window closes.
+
+Exceptionally large cohorts are left queued by `run` rather than spending its
+bounded post-child budget on aggregation; the recommended periodic `uatu
+flush` delivers them without that size guard.
+
+A digest is a summary of what uatu observed, not an inventory of the host's
+crontab: jobs with zero observed executions are absent, and it does not imply
+that missed runs were detected. Digests never replace or suppress configured
+immediate alerts: immediate network attempts run first, with at most 250ms of
+the existing post-child budget reserved to persist digest membership.
+
+Message limits keep complete summary lines, prioritize problem jobs and
+problem executions before recent successes, and end with exact omitted-job and
+omitted-execution-detail counts when necessary. Once a cohort is delivered or
+expires, an execution recorded later for that same closed UTC window remains
+in local history but does not open a second digest.
 
 Timeouts report as `failure` events with timeout detail. `--expected-duration`
 sends one mid-run `long_run` alert (the CLI flag implies the alert; from
@@ -249,14 +274,15 @@ Consequences worth knowing:
 - If the wrapper dies mid-run, the in-memory tail is lost — stale runs may
   have **head-only capture**.
 - `capture_mode = "full"` is an explicit opt-in footgun: a runaway job can
-  fill the disk during the run (retention only prunes afterwards). The free-
-  space preflight (`min_free_bytes`, default 100MB) disables capture for new
+  fill the disk during the run. Retention only prunes during maintenance. The
+  free-space preflight (`min_free_bytes`, default 100MB) disables capture for new
   runs on a nearly-full disk; mid-run write errors degrade capture for that
   stream only. The job itself is never touched.
 
 Retention defaults: 30 days, 1 GB of captured output (oldest output deleted
-first; run metadata is kept so history stays explainable). Runs after every
-`run`/`flush`, or manually via `uatu prune [--dry-run]`.
+first; run metadata is kept so history stays explainable). Pruning runs from
+`uatu flush`, or manually via `uatu prune [--dry-run]`; it stays out of the
+post-child path so an old or very large state directory cannot delay cron.
 
 ## Redaction
 

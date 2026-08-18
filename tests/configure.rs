@@ -205,3 +205,70 @@ fn wizard_eof_midway_still_writes_valid_config() {
     );
     assert_eq!(vcode, 0, "{vout}");
 }
+
+#[test]
+fn validate_warns_for_digest_in_routing_events_but_accepts_reporter_filter() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+[notify]
+events = ["failure", "digest"]
+reporters = ["discord.d"]
+digest = "daily"
+
+[reporters.discord.d]
+webhook_url = "https://example.invalid/hook"
+events = ["failure", "digest"]
+
+[jobs.batch]
+events = ["failure", "digest"]
+"#,
+    );
+
+    let (code, out, err) = env.run_code(&["config", "validate"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("config OK"), "{out}");
+
+    let warnings: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "only notify/job placements warn:\n{out}");
+    assert!(
+        warnings.iter().any(|line| line.contains("[notify].events")),
+        "{out}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("[jobs.batch].events")),
+        "{out}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|line| !line.contains("[reporters.discord.d].events")),
+        "reporter-level digest filtering is meaningful and must not warn:\n{out}"
+    );
+}
+
+#[test]
+fn init_template_explains_aggregate_digest_scope() {
+    let env = TestEnv::new();
+    let (code, out, err) = env.run_input(env.cmd_raw(&["init", "--stdout"]), "");
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(
+            "One aggregate is sent per eligible reporter, local host, cadence, and UTC window."
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("Only reporter-level events filters can exclude digest delivery."),
+        "{out}"
+    );
+    assert!(
+        out.contains("observed jobs/executions") && out.contains("not a crontab inventory"),
+        "{out}"
+    );
+}

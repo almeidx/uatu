@@ -56,7 +56,18 @@ pub fn reconcile(db: &Db, cfg: &Config, oplog: &OpLog) -> ReconcileOutcome {
                     None,
                 );
             }
-            crate::report::queue_digest_for_run(db, cfg, &run.run_id, &run.job_id, now);
+            if let Err(e) =
+                crate::report::queue_digest_for_run(db, cfg, &run.run_id, &run.job_id, now)
+            {
+                oplog.warn(
+                    "digest_queue_failed",
+                    &format!("cannot queue stale run for digest: {e}"),
+                    &[
+                        ("run_id", serde_json::json!(run.run_id)),
+                        ("job_id", serde_json::json!(run.job_id)),
+                    ],
+                );
+            }
             outcome.stale_run_ids.push(run.run_id);
         }
     }
@@ -83,6 +94,44 @@ pub fn reconcile(db: &Db, cfg: &Config, oplog: &OpLog) -> ReconcileOutcome {
                     &[("run_id", serde_json::json!(d.run_id))],
                 );
                 outcome.orphans_requeued += 1;
+            }
+        }
+    }
+
+    // Digest ownership lives on the compact cohort row. Reconcile one record
+    // per aggregate rather than materializing every execution membership.
+    if let Ok(sending) = db.sending_digest_cohorts() {
+        for cohort in sending {
+            let alive = match (
+                cohort.owner_pid,
+                cohort.owner_start_ticks,
+                cohort.owner_boot_id.as_deref(),
+            ) {
+                (Some(pid), Some(ticks), Some(boot)) => {
+                    liveness::is_alive(pid as i32, ticks as u64, boot)
+                }
+                _ => false,
+            };
+            if alive {
+                continue;
+            }
+            if let Ok(count) = db.digest_cohort_requeue_orphan(&cohort, now) {
+                if count == 0 {
+                    continue;
+                }
+                oplog.warn(
+                    "queue_orphan_requeued",
+                    &format!(
+                        "orphaned {} digest via {} requeued",
+                        cohort.period, cohort.reporter
+                    ),
+                    &[
+                        ("reporter", serde_json::json!(cohort.reporter)),
+                        ("digest_host", serde_json::json!(cohort.host)),
+                        ("digest_count", serde_json::json!(count)),
+                    ],
+                );
+                outcome.orphans_requeued += count;
             }
         }
     }
