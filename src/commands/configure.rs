@@ -408,7 +408,7 @@ fn ask_event_restriction<U: Ui>(
     let names = reporter_event_names();
     let defaults = event_defaults(current.as_deref(), &names, &names);
     let idx = p.multi_select(
-        "Events for this reporter (include digest to receive periodic summaries):",
+        "Events for this reporter (include digest to receive aggregate summaries):",
         &names,
         &defaults,
     )?;
@@ -917,30 +917,40 @@ fn parse_smtp_tls(s: &str) -> SmtpTls {
     }
 }
 
-/// Global digest cadence (`[notify].digest`). "off" is the schema default, so it
-/// is stored as `None` (an absent key) rather than an explicit `digest = "off"`.
+/// Global aggregate-digest cadence (`[notify].digest`). Jobs that inherit this
+/// cadence share a reporter/host/window cohort. "off" is the schema default, so
+/// it is stored as `None` (an absent key) rather than an explicit
+/// `digest = "off"`.
 fn ask_global_digest<U: Ui>(
     p: &mut U,
     current: Option<DigestPeriod>,
 ) -> PromptResult<Option<DigestPeriod>> {
+    p.say("  One aggregate per eligible reporter, local host, cadence, and UTC window.")?;
     let names: Vec<&str> = ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()).collect();
     let cur = current.unwrap_or(DigestPeriod::Off);
     let di = ALL_DIGEST_PERIODS
         .iter()
         .position(|d| *d == cur)
         .unwrap_or(0);
-    let sel = p.select("Periodic digest of job runs (global default)?", &names, di)?;
+    let sel = p.select(
+        "Aggregate digest of observed job executions (global default)?",
+        &names,
+        di,
+    )?;
     let period = ALL_DIGEST_PERIODS[sel];
     Ok((period != DigestPeriod::Off).then_some(period))
 }
 
 /// Per-job digest override. Option 0 ("use global") clears the override so the
-/// job inherits `[notify].digest`; any other choice — including "off" — is a
-/// real per-job override.
+/// job joins the global cadence cohort. "off" excludes it; another cadence
+/// creates a separate cohort.
 fn ask_job_digest<U: Ui>(
     p: &mut U,
     current: Option<DigestPeriod>,
 ) -> PromptResult<Option<DigestPeriod>> {
+    p.say(
+        "  Use global to join its aggregate; off excludes this job; another cadence creates a separate cohort.",
+    )?;
     let mut names = vec!["use global"];
     names.extend(ALL_DIGEST_PERIODS.iter().map(|d| d.as_str()));
     let di = match current {
@@ -951,7 +961,7 @@ fn ask_job_digest<U: Ui>(
             .map_or(0, |i| i + 1),
     };
     let sel = p.select(
-        "Digest cadence for this job? (use global = inherit)",
+        "Aggregate digest cadence for this job? (use global = join global cohort)",
         &names,
         di,
     )?;

@@ -20,6 +20,44 @@ webhook_url = "{url}"
     )
 }
 
+fn make_digest_cohorts_due(db: &uatu::db::Db) {
+    let due = uatu::util::now_ms() - 1_000;
+    let updated = db
+        .conn
+        .execute(
+            "UPDATE digest_cohorts SET next_attempt_ms=?1 WHERE state='queued'",
+            rusqlite::params![due],
+        )
+        .unwrap();
+    assert!(updated > 0, "expected at least one queued digest cohort");
+}
+
+fn merge_digest_memberships_into_one_test_cohort(db: &uatu::db::Db) {
+    let (cohort_id, start, end): (i64, i64, i64) = db
+        .conn
+        .query_row(
+            r#"SELECT id, digest_start_ms, digest_end_ms
+FROM digest_cohorts ORDER BY id LIMIT 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            r#"UPDATE deliveries
+SET digest_cohort_id=?1, digest_start_ms=?2, digest_end_ms=?3
+WHERE event='digest'"#,
+            rusqlite::params![cohort_id, start, end],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "DELETE FROM digest_cohorts WHERE id != ?1",
+            rusqlite::params![cohort_id],
+        )
+        .unwrap();
+}
+
 #[test]
 fn discord_receives_expected_embed_payload() {
     let server = FakeDiscord::start(vec![]);
@@ -218,8 +256,8 @@ webhook_url = "{}"
         server.url()
     ));
 
-    env.run_ok(&["run", "--name", "digest-job", "--", "true"]);
-    env.run_ok(&["run", "--name", "digest-job", "--", "true"]);
+    env.run_ok(&["run", "--name", "digest-alpha", "--", "true"]);
+    env.run_ok(&["run", "--name", "digest-beta", "--", "true"]);
     assert_eq!(server.hit_count(), 0, "successes are queued for digest");
 
     let db = env.db();
@@ -234,34 +272,39 @@ webhook_url = "{}"
     assert_eq!(queued_digest_rows, 2);
     drop(db);
 
-    let (code, _, _) = env.run_code(&["run", "--name", "digest-job", "--", "false"]);
+    let (code, _, _) = env.run_code(&["run", "--name", "digest-beta", "--", "false"]);
     assert_eq!(code, 1);
     assert_eq!(server.hit_count(), 1, "failure remains immediate");
-    assert_eq!(server.embed(0)["title"], "FAILURE: digest-job");
+    assert_eq!(server.embed(0)["title"], "FAILURE: digest-beta");
 
     {
         let db = env.db();
-        let due = uatu::util::now_ms() - 1000;
-        let start = due - 3_600_000;
-        db.conn
-            .execute(
-                &format!(
-                    "UPDATE deliveries SET next_attempt_ms={due}, digest_start_ms={start}, digest_end_ms={due} WHERE event='digest'"
-                ),
-                [],
-            )
-            .unwrap();
+        merge_digest_memberships_into_one_test_cohort(&db);
+        make_digest_cohorts_due(&db);
     }
 
     env.run_ok(&["flush"]);
-    assert_eq!(server.hit_count(), 2, "one digest for three runs");
+    assert_eq!(
+        server.hit_count(),
+        2,
+        "one aggregate digest for three runs across two jobs"
+    );
     let digest = server.embed(1);
-    assert_eq!(digest["title"], "DIGEST: digest-job");
+    assert_eq!(digest["title"], "DIGEST: hourly");
     let desc = digest["description"].as_str().unwrap();
-    assert!(desc.contains("total runs: 3"), "{desc}");
+    assert!(desc.contains("observed jobs: 2"), "{desc}");
+    assert!(desc.contains("executions: 3"), "{desc}");
     assert!(desc.contains("success=2"), "{desc}");
     assert!(desc.contains("failure=1"), "{desc}");
     assert!(desc.contains("period: hourly"), "{desc}");
+    assert!(desc.contains("job: digest-alpha"), "{desc}");
+    assert!(desc.contains("job: digest-beta"), "{desc}");
+    let beta = desc.find("job: digest-beta").unwrap();
+    let alpha = desc.find("job: digest-alpha").unwrap();
+    assert!(
+        beta < alpha,
+        "the job with a problem is listed first: {desc}"
+    );
 
     let db = env.db();
     let delivered_digest_rows: i64 = db
@@ -273,6 +316,553 @@ webhook_url = "{}"
         )
         .unwrap();
     assert_eq!(delivered_digest_rows, 3);
+}
+
+#[test]
+fn immediate_alert_is_sent_before_a_due_digest() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = ["failure"]
+reporters = ["discord.d"]
+digest = "hourly"
+
+[reporters.discord.d]
+webhook_url = "{}"
+
+[jobs.failed]
+digest = "off"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "first", "--", "true"]);
+    {
+        let db = env.db();
+        make_digest_cohorts_due(&db);
+    }
+
+    let (code, _, _) = env.run_code(&["run", "--name", "failed", "--", "false"]);
+    assert_eq!(code, 1);
+    assert_eq!(server.hit_count(), 2);
+    assert_eq!(server.embed(0)["title"], "FAILURE: failed");
+    assert_eq!(server.embed(1)["title"], "DIGEST: hourly");
+}
+
+#[test]
+fn exhausted_immediate_attempt_still_persists_digest_membership() {
+    let server = FakeDiscord::start(vec![Behavior::Hang(Duration::from_secs(8))]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = ["failure"]
+reporters = ["discord.d"]
+digest = "hourly"
+
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+        server.url()
+    ));
+
+    let out = env
+        .cmd(&["run", "--name", "budgeted-digest", "--", "false"])
+        .env("UATU_PER_REPORTER_BUDGET_MS", "800")
+        .env("UATU_OVERALL_BUDGET_MS", "1000")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    let db = env.db();
+    let memberships: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE event='digest' AND job_id='budgeted-digest'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(memberships, 1, "network budget must not omit the digest");
+}
+
+#[test]
+fn aggregate_digest_retry_transitions_the_whole_cross_job_group() {
+    let server = FakeDiscord::start(vec![Behavior::Status(500), Behavior::Ok]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[global]
+host_name = "test-host-01"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "aggregate-a", "--", "true"]);
+    env.run_ok(&["run", "--name", "aggregate-b", "--", "true"]);
+    {
+        let db = env.db();
+        merge_digest_memberships_into_one_test_cohort(&db);
+        make_digest_cohorts_due(&db);
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 1, "one failed aggregate attempt");
+    {
+        let db = env.db();
+        let (queued, attempts, retry_times): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), SUM(attempt_count), COUNT(DISTINCT next_attempt_ms) FROM deliveries WHERE event='digest' AND state='queued'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, 2, "both jobs remain queued after one failure");
+        assert_eq!(attempts, 2, "each group member records the attempt");
+        assert_eq!(retry_times, 1, "the group shares one retry time");
+        make_digest_cohorts_due(&db);
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 2, "one aggregate retry");
+    let retry = server.embed(1);
+    let desc = retry["description"].as_str().unwrap();
+    assert!(desc.contains("DELAYED DIGEST RETRY"), "{desc}");
+    assert!(desc.contains("job: aggregate-a"), "{desc}");
+    assert!(desc.contains("job: aggregate-b"), "{desc}");
+
+    let db = env.db();
+    let delivered: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE event='digest' AND state='delivered'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered, 2);
+}
+
+#[test]
+fn aggregate_digest_waits_for_cohort_retry_and_claims_mixed_row_times_once() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "retry-a", "--", "true"]);
+    env.run_ok(&["run", "--name", "retry-b", "--", "true"]);
+    {
+        let db = env.db();
+        merge_digest_memberships_into_one_test_cohort(&db);
+        let now = uatu::util::now_ms();
+        let due = now - 1_000;
+        let later = now + 60_000;
+        db.conn
+            .execute(
+                r#"UPDATE deliveries
+SET next_attempt_ms=CASE job_id WHEN 'retry-a' THEN ?1 ELSE ?2 END
+WHERE event='digest'"#,
+                rusqlite::params![due, later],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE digest_cohorts SET next_attempt_ms=?1 WHERE state='queued'",
+                rusqlite::params![later],
+            )
+            .unwrap();
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(
+        server.hit_count(),
+        0,
+        "one due membership must not bypass the cohort-wide retry gate"
+    );
+
+    {
+        let db = env.db();
+        make_digest_cohorts_due(&db);
+    }
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 1, "the cohort produces one message");
+    let desc = server.embed(0)["description"].as_str().unwrap().to_string();
+    assert!(desc.contains("job: retry-a"), "{desc}");
+    assert!(desc.contains("job: retry-b"), "{desc}");
+
+    let db = env.db();
+    let delivered: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE event='digest' AND state='delivered'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered, 2, "all current members share the outcome");
+    drop(db);
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 1, "the cohort is not delivered twice");
+}
+
+#[test]
+fn aggregate_digest_uses_recorded_host_as_part_of_cohort_identity() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    let config = |host: &str| {
+        format!(
+            r#"
+[global]
+host_name = "{host}"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+            server.url()
+        )
+    };
+
+    env.write_config(&config("recorded-host-a"));
+    env.run_ok(&["run", "--name", "host-a-job", "--", "true"]);
+    env.write_config(&config("recorded-host-b"));
+    env.run_ok(&["run", "--name", "host-b-job", "--", "true"]);
+
+    {
+        let db = env.db();
+        let (start, end): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT digest_start_ms, digest_end_ms FROM digest_cohorts ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        // Pin an identical window even if this test happened to straddle an
+        // hour boundary; host must be the only cohort-identity difference.
+        db.conn
+            .execute(
+                "UPDATE digest_cohorts SET digest_start_ms=?1, digest_end_ms=?2",
+                rusqlite::params![start, end],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE deliveries SET digest_start_ms=?1, digest_end_ms=?2 WHERE event='digest'",
+                rusqlite::params![start, end],
+            )
+            .unwrap();
+        let identities: Vec<(String, i64, i64)> = db
+            .conn
+            .prepare(
+                "SELECT host, digest_start_ms, digest_end_ms FROM digest_cohorts ORDER BY host",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            identities,
+            [
+                ("recorded-host-a".to_string(), start, end),
+                ("recorded-host-b".to_string(), start, end),
+            ]
+        );
+        make_digest_cohorts_due(&db);
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(
+        server.hit_count(),
+        2,
+        "the same reporter/window has one cohort per recorded host"
+    );
+    let descriptions = [
+        server.embed(0)["description"].as_str().unwrap().to_string(),
+        server.embed(1)["description"].as_str().unwrap().to_string(),
+    ];
+    assert!(
+        descriptions
+            .iter()
+            .any(|desc| desc.contains("host: recorded-host-a") && desc.contains("job: host-a-job")),
+        "{descriptions:?}"
+    );
+    assert!(
+        descriptions
+            .iter()
+            .any(|desc| desc.contains("host: recorded-host-b") && desc.contains("job: host-b-job")),
+        "{descriptions:?}"
+    );
+}
+
+#[test]
+fn aggregate_digest_late_membership_does_not_resend_delivered_cohort() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    let config = format!(
+        r#"
+[global]
+host_name = "stable-host"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+"#,
+        server.url()
+    );
+    env.write_config(&config);
+
+    env.run_ok(&["run", "--name", "on-time", "--", "true"]);
+    {
+        let db = env.db();
+        make_digest_cohorts_due(&db);
+    }
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 1);
+
+    let digest = {
+        let db = env.db();
+        db.conn
+            .query_row(
+                r#"SELECT digest_period, digest_start_ms, digest_end_ms
+FROM digest_cohorts WHERE state='delivered'"#,
+                [],
+                |row| {
+                    Ok(uatu::db::DeliveryDigest {
+                        period: row.get(0)?,
+                        start_ms: row.get(1)?,
+                        end_ms: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap()
+    };
+
+    // Create another terminal run without automatically assigning its natural
+    // current-window membership, then target the delivered identity directly.
+    env.write_config(&format!("{config}\n[jobs.late]\ndigest = \"off\"\n"));
+    env.run_ok(&["run", "--name", "late", "--", "true"]);
+    {
+        let db = env.db();
+        let run_id: String = db
+            .conn
+            .query_row(
+                "SELECT run_id FROM runs WHERE job_id='late' ORDER BY start_ms DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.insert_digest_delivery(
+            &run_id,
+            "late",
+            "digest",
+            "discord.d",
+            "queued",
+            uatu::util::now_ms(),
+            Some(digest.end_ms),
+            None,
+            &digest,
+        )
+        .unwrap();
+    }
+    env.run_ok(&["flush"]);
+    assert_eq!(
+        server.hit_count(),
+        1,
+        "membership added to a delivered identity must not create a second message"
+    );
+    let db = env.db();
+    let state: String = db
+        .conn
+        .query_row(
+            "SELECT state FROM deliveries WHERE event='digest' AND job_id='late'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "expired", "late membership is terminally suppressed");
+}
+
+#[test]
+fn aggregate_digest_keeps_distinct_cadence_cohorts_separate() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+[reporters.discord.d]
+webhook_url = "{}"
+[jobs.daily-job]
+digest = "daily"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "hourly-job", "--", "true"]);
+    env.run_ok(&["run", "--name", "daily-job", "--", "true"]);
+    {
+        let db = env.db();
+        make_digest_cohorts_due(&db);
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(
+        server.hit_count(),
+        2,
+        "different effective cadences produce separate aggregate messages"
+    );
+    let titles = [
+        server.embed(0)["title"].as_str().unwrap().to_string(),
+        server.embed(1)["title"].as_str().unwrap().to_string(),
+    ];
+    assert!(titles.iter().any(|title| title == "DIGEST: hourly"));
+    assert!(titles.iter().any(|title| title == "DIGEST: daily"));
+}
+
+#[test]
+fn aggregate_digest_eligibility_uses_cadence_and_reporter_filter_only() {
+    let accepts = FakeDiscord::start(vec![]);
+    let rejects = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = ["digest"]
+reporters = ["discord.accepts", "discord.rejects"]
+digest = "hourly"
+
+[reporters.discord.accepts]
+webhook_url = "{}"
+events = ["digest"]
+
+[reporters.discord.rejects]
+webhook_url = "{}"
+events = ["failure"]
+
+[jobs.included]
+events = ["digest"]
+
+[jobs.excluded]
+events = ["digest"]
+digest = "off"
+"#,
+        accepts.url(),
+        rejects.url(),
+    ));
+
+    env.run_ok(&["run", "--name", "included", "--", "true"]);
+    env.run_ok(&["run", "--name", "excluded", "--", "true"]);
+    assert_eq!(
+        accepts.hit_count(),
+        0,
+        "digest in notify/job events must not become an immediate alert"
+    );
+    assert_eq!(rejects.hit_count(), 0);
+
+    {
+        let db = env.db();
+        let rows: Vec<(String, String)> = db
+            .conn
+            .prepare("SELECT job_id, reporter FROM deliveries WHERE event='digest'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [("included".to_string(), "discord.accepts".to_string())],
+            "per-job off excludes membership and only a reporter-level filter controls delivery"
+        );
+
+        make_digest_cohorts_due(&db);
+    }
+
+    env.run_ok(&["flush"]);
+    assert_eq!(accepts.hit_count(), 1, "eligible reporter gets one digest");
+    assert_eq!(rejects.hit_count(), 0, "reporter filter excludes digest");
+    let desc = accepts.embed(0)["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(desc.contains("observed jobs: 1"), "{desc}");
+    assert!(desc.contains("executions: 1"), "{desc}");
+    assert!(desc.contains("job: included"), "{desc}");
+    assert!(!desc.contains("job: excluded"), "{desc}");
+}
+
+#[test]
+fn oversized_aggregate_is_deferred_from_run_path_to_explicit_flush() {
+    let server = FakeDiscord::start(vec![]);
+    let env = TestEnv::new();
+    env.write_config(&format!(
+        r#"
+[notify]
+events = []
+reporters = ["discord.d"]
+digest = "hourly"
+
+[reporters.discord.d]
+webhook_url = "{}"
+
+[jobs.trigger]
+digest = "off"
+"#,
+        server.url()
+    ));
+
+    env.run_ok(&["run", "--name", "large-cohort-member", "--", "true"]);
+    {
+        let db = env.db();
+        make_digest_cohorts_due(&db);
+        // Exercise the durable size gate without spawning thousands of child
+        // processes; explicit flush intentionally ignores this guard.
+        db.conn
+            .execute(
+                "UPDATE digest_cohorts SET member_count=2049 WHERE state='queued'",
+                [],
+            )
+            .unwrap();
+    }
+
+    env.run_ok(&["run", "--name", "trigger", "--", "true"]);
+    assert_eq!(
+        server.hit_count(),
+        0,
+        "the bounded child-exit path must leave a large cohort queued"
+    );
+
+    env.run_ok(&["flush"]);
+    assert_eq!(server.hit_count(), 1, "explicit flush drains the cohort");
+    let desc = server.embed(0)["description"].as_str().unwrap().to_string();
+    assert!(desc.contains("job: large-cohort-member"), "{desc}");
 }
 
 #[test]

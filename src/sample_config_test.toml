@@ -1,4 +1,4 @@
-# Test fixture: the sample config from SPEC §4, verbatim semantics.
+# Test fixture: full sample configuration for parser coverage.
 [global]
 data_dir = "~/.local/state/uatu"
 host_name = "prod-worker-01"
@@ -29,9 +29,12 @@ regex = [
 ]
 
 [notify]
+# Immediate alert events. Digest cadence and filtering are configured separately.
 events = ["success", "failure"]
 reporters = ["discord.default", "smtp.ops"]
 failure_output = true
+# One aggregate per eligible reporter, local host, effective cadence, and UTC window.
+# Contents are observed jobs/executions, not a crontab inventory or missed-run report.
 digest = "off"
 
 [reporters.discord.default]
@@ -47,7 +50,8 @@ password = "smtp-password"
 from = "uatu@example.com"
 recipients = ["ops@example.com"]
 max_message_chars = 20000
-events = ["failure", "recovery", "stale"]
+# Only reporter-level events may filter aggregate digest delivery.
+events = ["failure", "recovery", "stale", "digest"]
 
 [jobs.nightly-backup]
 cwd = "/srv/app"
@@ -57,6 +61,7 @@ expected_duration = "45m"
 schedule_label = "nightly at 02:00"
 reporters = ["discord.default", "smtp.ops"]
 events = ["success", "failure", "recovery", "stale", "long_run"]
+# A different cadence forms another aggregate cohort; "off" excludes this job.
 digest = "daily"
 capture_stdout = true
 capture_stderr = true

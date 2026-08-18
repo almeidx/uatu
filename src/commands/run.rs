@@ -44,6 +44,14 @@ const EXIT_INTERNAL: i32 = 125;
 const EXIT_NOT_EXECUTABLE: i32 = 126;
 const EXIT_NOT_FOUND: i32 = 127;
 
+// Opening includes forward-only migrations. A legacy queue may make a
+// migration expensive, but state maintenance must never hold the child start
+// indefinitely; the run degrades to passthrough after the normal SQLite
+// contention budget.
+const STATE_OPEN_BUDGET: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_BUDGET: Duration = Duration::from_secs(5);
+const DIGEST_QUEUE_MAX_RESERVE: Duration = Duration::from_millis(250);
+
 fn warn(msg: &str) {
     eprintln!("uatu: warning: {msg}");
 }
@@ -507,7 +515,6 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             "failure" | "timeout" => events_to_send.push(Event::Failure),
             _ => {}
         }
-        report::queue_digest_for_run(&db, &cfg, &run_id, &job_id, end_ms);
         deliver_run_events(
             &db,
             &cfg,
@@ -519,14 +526,18 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             &events_to_send,
             eff.expected_from_cli,
             interrupted_by.is_some(),
+            end_ms,
             &redactor,
         );
     }
 
-    // Wait for a still-running long_run delivery thread briefly; its rows
-    // become reclaimable orphans if we exit first (at-least-once is fine).
+    // Collect a completed long_run sender without waiting past the child path.
+    // An unfinished sender remains owner-scoped and is requeued as an orphan
+    // after this wrapper exits (at-least-once is fine).
     if let Some(t) = long_run_thread {
-        let _ = t.join();
+        if t.is_finished() {
+            let _ = t.join();
+        }
     }
 
     wrapper_exit
@@ -544,7 +555,7 @@ fn open_state(
         config::log_max_bytes(cfg),
         Arc::clone(redactor),
     );
-    let db = Db::open(&paths.db).map_err(|e| {
+    let db = Db::open_bounded(&paths.db, STATE_OPEN_BUDGET).map_err(|e| {
         oplog.error("state_unavailable", &e.to_string(), &[]);
         format!("cannot open state database: {e}")
     })?;
@@ -914,8 +925,11 @@ fn fire_long_run(
     }))
 }
 
-/// Insert + synchronously attempt this run's own events within the budgets,
-/// then opportunistically flush and prune under the flush lock (SPEC §3, §8).
+/// Queue and synchronously attempt this run's immediate events first, then
+/// queue its digest membership and opportunistically flush already-queued
+/// deliveries within the shared post-child budget (SPEC §3, §8). Reconcile
+/// and retention work stays in inspection/maintenance commands, where it
+/// cannot delay a completed cron job.
 #[allow(clippy::too_many_arguments)]
 fn deliver_run_events(
     db: &Db,
@@ -928,12 +942,54 @@ fn deliver_run_events(
     events_to_send: &[Event],
     expected_from_cli: bool,
     interrupted: bool,
+    digest_event_ms: i64,
     redactor: &Arc<Redactor>,
 ) {
+    let overall_budget = report::overall_budget();
+    let overall_deadline = Instant::now() + overall_budget;
+    let digest_targeted = config::digest_period(cfg, job_id) != config::DigestPeriod::Off
+        && !events::reporters_for_digest(cfg, job_id).is_empty();
+    // Immediate network attempts stay first, but cannot consume the final
+    // sliver needed to durably batch this execution into its digest cohort.
+    // With the production budget this reserves 250ms; smaller test budgets
+    // reserve 10% so immediate alerts retain 90% of the cap.
+    let digest_reserve = if digest_targeted {
+        Duration::from_millis(
+            ((overall_budget.as_millis() / 10).min(DIGEST_QUEUE_MAX_RESERVE.as_millis())) as u64,
+        )
+    } else {
+        Duration::ZERO
+    };
+    let immediate_deadline = overall_deadline
+        .checked_sub(digest_reserve)
+        .unwrap_or(overall_deadline);
     let now = now_ms();
     let mut own_rows: Vec<i64> = Vec::new();
-    for event in events_to_send {
+
+    'immediate: for event in events_to_send {
         for reporter in events::reporters_for_event(cfg, job_id, *event, expected_from_cli) {
+            let remaining = overall_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let msg = "post-child budget exhausted before all immediate alerts were queued";
+                warn(msg);
+                oplog.warn(
+                    "delivery_queue_failed",
+                    msg,
+                    &[
+                        ("run_id", serde_json::json!(run_id)),
+                        ("job_id", serde_json::json!(job_id)),
+                    ],
+                );
+                break 'immediate;
+            }
+            // A busy SQLite writer must not consume more than the remaining
+            // post-child budget. Restore the normal timeout after insertion.
+            if let Err(e) = db.conn.busy_timeout(remaining.min(SQLITE_BUSY_BUDGET)) {
+                let msg = format!("cannot bound immediate-alert queue write: {e}");
+                warn(&msg);
+                oplog.warn("delivery_queue_failed", &msg, &[]);
+                break 'immediate;
+            }
             // Interrupted wrappers enqueue without sending (SPEC §3).
             let (state, next, owner) = if interrupted {
                 ("queued", Some(now), None)
@@ -951,15 +1007,37 @@ fn deliver_run_events(
                 owner,
             ) {
                 Ok(id) if !interrupted => own_rows.push(id),
-                _ => {}
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("cannot queue immediate alert via {reporter}: {e}");
+                    warn(&msg);
+                    oplog.warn(
+                        "delivery_queue_failed",
+                        &msg,
+                        &[
+                            ("run_id", serde_json::json!(run_id)),
+                            ("job_id", serde_json::json!(job_id)),
+                        ],
+                    );
+                }
             }
         }
     }
+    let _ = db.conn.busy_timeout(SQLITE_BUSY_BUDGET);
+
     if interrupted {
+        queue_digest_with_budget(
+            db,
+            cfg,
+            oplog,
+            run_id,
+            job_id,
+            digest_event_ms,
+            overall_deadline,
+        );
         return;
     }
 
-    let overall_deadline = Instant::now() + report::overall_budget();
     let sender = match Sender::new() {
         Ok(s) => Some(s),
         Err(e) => {
@@ -977,46 +1055,117 @@ fn deliver_run_events(
             redactor: redactor.as_ref(),
         };
         for id in &own_rows {
-            let remaining = overall_deadline.saturating_duration_since(Instant::now());
+            let remaining = immediate_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let _ = db.delivery_requeue(*id, now_ms());
-                continue;
+                // Leave the remaining owner-scoped rows in `sending` rather
+                // than wait past the cap. Reconciliation requeues them after
+                // this wrapper exits.
+                break;
             }
+            let _ = db.conn.busy_timeout(remaining.min(SQLITE_BUSY_BUDGET));
             if let Ok(Some(row)) = db.get_delivery(*id) {
-                report::deliver_row(&ctx, &row, report::per_reporter_budget().min(remaining));
-            }
-        }
-
-        // Opportunistic flush + prune, only if the lock is free (SPEC §7);
-        // lock busy means another flusher is doing the work.
-        if let Ok(Some(_guard)) = lock::try_acquire(&paths.lock) {
-            crate::reconcile::reconcile(db, cfg, oplog);
-            report::deliver_due(&ctx, me, Some(overall_deadline));
-            match crate::db::prune(
-                db,
-                &paths.output,
-                cfg.retention_max_age(),
-                cfg.retention_max_bytes(),
-                false,
-            ) {
-                Ok(r) if !r.is_empty() => oplog.info(
-                    "prune_completed",
-                    &format!(
-                        "pruned {} aged runs, {} output dirs, {} freed",
-                        r.aged_runs.len(),
-                        r.output_pruned_runs.len(),
-                        crate::util::format_bytes(r.bytes_freed)
-                    ),
-                    &[],
-                ),
-                Ok(_) => {}
-                Err(e) => oplog.warn("prune_completed", &format!("prune failed: {e}"), &[]),
+                report::deliver_row_with_deadline(
+                    &ctx,
+                    &row,
+                    report::per_reporter_budget().min(remaining),
+                    Some(immediate_deadline),
+                );
             }
         }
     } else {
         for id in &own_rows {
+            let remaining = immediate_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break; // orphan reconciliation recovers the rest
+            }
+            let _ = db.conn.busy_timeout(remaining.min(SQLITE_BUSY_BUDGET));
             let _ = db.delivery_requeue(*id, now_ms());
         }
+    }
+
+    // Digest bookkeeping is one transaction across all reporters and happens
+    // only after this run's configured immediate alerts have been attempted.
+    queue_digest_with_budget(
+        db,
+        cfg,
+        oplog,
+        run_id,
+        job_id,
+        digest_event_ms,
+        overall_deadline,
+    );
+
+    let Some(sender) = &sender else { return };
+    let ctx = DeliverCtx {
+        db,
+        cfg,
+        oplog,
+        sender,
+        host: cfg.host_name(),
+        redactor: redactor.as_ref(),
+    };
+    // Opportunistic delivery only if the flush lock is free (SPEC §7). Keep
+    // reconciliation and retention out of the child-exit path: both can scan
+    // unbounded local state and are handled by inspection/flush/prune.
+    if !overall_deadline
+        .saturating_duration_since(Instant::now())
+        .is_zero()
+    {
+        if let Ok(Some(_guard)) = lock::try_acquire(&paths.lock) {
+            report::deliver_due(&ctx, me, Some(overall_deadline));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_digest_with_budget(
+    db: &Db,
+    cfg: &Config,
+    oplog: &OpLog,
+    run_id: &str,
+    job_id: &str,
+    event_ms: i64,
+    overall_deadline: Instant,
+) {
+    let remaining = overall_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        let period = config::digest_period(cfg, job_id);
+        if period != config::DigestPeriod::Off
+            && !events::reporters_for_digest(cfg, job_id).is_empty()
+        {
+            let msg = "post-child budget exhausted before digest membership could be queued";
+            warn(msg);
+            oplog.warn(
+                "digest_queue_failed",
+                msg,
+                &[
+                    ("run_id", serde_json::json!(run_id)),
+                    ("job_id", serde_json::json!(job_id)),
+                ],
+            );
+        }
+        return;
+    }
+    if let Err(e) = db.conn.busy_timeout(remaining.min(SQLITE_BUSY_BUDGET)) {
+        let msg = format!("cannot bound digest queue write: {e}");
+        warn(&msg);
+        oplog.warn("digest_queue_failed", &msg, &[]);
+        return;
+    }
+    let result =
+        report::queue_digest_for_run_bounded(db, cfg, run_id, job_id, event_ms, overall_deadline);
+    let _ = db.conn.busy_timeout(SQLITE_BUSY_BUDGET);
+    if let Err(e) = result {
+        let msg = format!("cannot queue run for digest: {e}");
+        warn(&msg);
+        oplog.warn(
+            "digest_queue_failed",
+            &msg,
+            &[
+                ("run_id", serde_json::json!(run_id)),
+                ("job_id", serde_json::json!(job_id)),
+            ],
+        );
     }
 }
 
@@ -1046,7 +1195,7 @@ fn finish_start_failure(
     );
     if db_ok {
         let end_ms = now_ms();
-        let _ = db.finish_run(
+        let recorded = match db.finish_run(
             run_id,
             "start_failed",
             end_ms,
@@ -1058,9 +1207,14 @@ fn finish_start_failure(
             false,
             &CaptureMeta::default(),
             &CaptureMeta::default(),
-        );
-        if reporters_enabled {
-            report::queue_digest_for_run(db, cfg, run_id, job_id, end_ms);
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                warn(&format!("cannot record start failure: {e}"));
+                false
+            }
+        };
+        if reporters_enabled && recorded {
             // start_failed reports as a failure event with start detail (SPEC §8).
             deliver_run_events(
                 db,
@@ -1073,6 +1227,7 @@ fn finish_start_failure(
                 &[Event::Failure],
                 false,
                 false,
+                end_ms,
                 redactor,
             );
         }
