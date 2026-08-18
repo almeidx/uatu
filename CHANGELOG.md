@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.1.1-alpha.7] - 2026-08-18
+
+- Refactor digest notifications and configuration workflows (#43)
+- deps: Lock file maintenance (#42)
+- deps: Update Rust crate rusqlite to 0.40.2 (#41)
+- deps: Lock file maintenance (#40)
+- deps: Update patch/minor dependencies (#39)
+- deps: Lock file maintenance (#38)
+- deps: Update patch/minor dependencies (#37)
+- chore: schedule Renovate updates for Saturday mornings
+
+
 ## [0.1.1-alpha.6] - 2026-07-27
 
 - deps: Update Rust crate jiff to 0.2.35 (#35)
