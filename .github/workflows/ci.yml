@@ -67,18 +67,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            use_cross: false
-            install_musl: true
+            use_cross: true
             verify_static: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
-            install_musl: false
             verify_static: false
           - target: aarch64-apple-darwin
             os: macos-15
             use_cross: false
-            install_musl: false
             verify_static: false
     steps:
       - uses: actions/checkout@v7
@@ -93,10 +90,6 @@ jobs:
         with:
           shared-key: ${{ matrix.target }}
           cache-on-failure: true
-
-      - name: Install musl tools
-        if: ${{ matrix.install_musl }}
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cross
         if: ${{ matrix.use_cross }}
