@@ -292,15 +292,17 @@ webhook_url = "{}"
     let digest = server.embed(1);
     assert_eq!(digest["title"], "DIGEST: hourly");
     let desc = digest["description"].as_str().unwrap();
-    assert!(desc.contains("observed jobs: 2"), "{desc}");
-    assert!(desc.contains("executions: 3"), "{desc}");
-    assert!(desc.contains("success=2"), "{desc}");
-    assert!(desc.contains("failure=1"), "{desc}");
-    assert!(desc.contains("period: hourly"), "{desc}");
-    assert!(desc.contains("job: digest-alpha"), "{desc}");
-    assert!(desc.contains("job: digest-beta"), "{desc}");
-    let beta = desc.find("job: digest-beta").unwrap();
-    let alpha = desc.find("job: digest-alpha").unwrap();
+    assert!(
+        desc.contains("**3 executions** across **2 jobs**"),
+        "{desc}"
+    );
+    assert!(desc.contains("2 success"), "{desc}");
+    assert!(desc.contains("1 failure"), "{desc}");
+    assert!(desc.contains("hourly"), "{desc}");
+    assert!(desc.contains("**digest-alpha**"), "{desc}");
+    assert!(desc.contains("**digest-beta**"), "{desc}");
+    let beta = desc.find("**digest-beta**").unwrap();
+    let alpha = desc.find("**digest-alpha**").unwrap();
     assert!(
         beta < alpha,
         "the job with a problem is listed first: {desc}"
@@ -437,8 +439,8 @@ webhook_url = "{}"
     let retry = server.embed(1);
     let desc = retry["description"].as_str().unwrap();
     assert!(desc.contains("DELAYED DIGEST RETRY"), "{desc}");
-    assert!(desc.contains("job: aggregate-a"), "{desc}");
-    assert!(desc.contains("job: aggregate-b"), "{desc}");
+    assert!(desc.contains("**aggregate-a**"), "{desc}");
+    assert!(desc.contains("**aggregate-b**"), "{desc}");
 
     let db = env.db();
     let delivered: i64 = db
@@ -506,8 +508,8 @@ WHERE event='digest'"#,
     env.run_ok(&["flush"]);
     assert_eq!(server.hit_count(), 1, "the cohort produces one message");
     let desc = server.embed(0)["description"].as_str().unwrap().to_string();
-    assert!(desc.contains("job: retry-a"), "{desc}");
-    assert!(desc.contains("job: retry-b"), "{desc}");
+    assert!(desc.contains("**retry-a**"), "{desc}");
+    assert!(desc.contains("**retry-b**"), "{desc}");
 
     let db = env.db();
     let delivered: i64 = db
@@ -606,13 +608,13 @@ webhook_url = "{}"
     assert!(
         descriptions
             .iter()
-            .any(|desc| desc.contains("host: recorded-host-a") && desc.contains("job: host-a-job")),
+            .any(|desc| desc.contains("**recorded-host-a**") && desc.contains("**host-a-job**")),
         "{descriptions:?}"
     );
     assert!(
         descriptions
             .iter()
-            .any(|desc| desc.contains("host: recorded-host-b") && desc.contains("job: host-b-job")),
+            .any(|desc| desc.contains("**recorded-host-b**") && desc.contains("**host-b-job**")),
         "{descriptions:?}"
     );
 }
@@ -812,10 +814,9 @@ digest = "off"
         .as_str()
         .unwrap()
         .to_string();
-    assert!(desc.contains("observed jobs: 1"), "{desc}");
-    assert!(desc.contains("executions: 1"), "{desc}");
-    assert!(desc.contains("job: included"), "{desc}");
-    assert!(!desc.contains("job: excluded"), "{desc}");
+    assert!(desc.contains("**1 execution** across **1 job**"), "{desc}");
+    assert!(desc.contains("**included**"), "{desc}");
+    assert!(!desc.contains("**excluded**"), "{desc}");
 }
 
 #[test]
@@ -862,7 +863,7 @@ digest = "off"
     env.run_ok(&["flush"]);
     assert_eq!(server.hit_count(), 1, "explicit flush drains the cohort");
     let desc = server.embed(0)["description"].as_str().unwrap().to_string();
-    assert!(desc.contains("job: large-cohort-member"), "{desc}");
+    assert!(desc.contains("**large-cohort-member**"), "{desc}");
 }
 
 #[test]

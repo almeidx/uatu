@@ -196,14 +196,52 @@ pub struct DigestStatusCounts {
     pub active: u64,
 }
 
+/// The status vocabulary in report order, each paired with the icon Discord
+/// renders for it. Every status label, ordering and icon in a digest derives
+/// from this table so the two renderers can never disagree.
+const DIGEST_STATUSES: [(&str, &str); 6] = [
+    ("success", "✅"),
+    ("failure", "❌"),
+    ("timeout", "⏱️"),
+    ("start_failed", "⛔"),
+    ("stale", "⚠️"),
+    ("active", "⏳"),
+];
+
+const DIGEST_UNKNOWN_STATUS_ICON: &str = "▫️";
+
+fn digest_status_icon(status: &str) -> &'static str {
+    DIGEST_STATUSES
+        .iter()
+        .find(|(name, _)| *name == status)
+        .map_or(DIGEST_UNKNOWN_STATUS_ICON, |(_, icon)| *icon)
+}
+
 impl DigestStatusCounts {
+    fn count_of(self, status: &str) -> u64 {
+        match status {
+            "success" => self.success,
+            "failure" => self.failure,
+            "timeout" => self.timeout,
+            "start_failed" => self.start_failed,
+            "stale" => self.stale,
+            "active" => self.active,
+            _ => 0,
+        }
+    }
+
+    fn entries(self) -> impl Iterator<Item = (&'static str, &'static str, u64)> {
+        DIGEST_STATUSES
+            .into_iter()
+            .map(move |(name, icon)| (name, icon, self.count_of(name)))
+    }
+
+    fn present(self) -> impl Iterator<Item = (&'static str, &'static str, u64)> {
+        self.entries().filter(|(_, _, count)| *count > 0)
+    }
+
     fn has_problem(self) -> bool {
-        self.failure
-            .saturating_add(self.timeout)
-            .saturating_add(self.start_failed)
-            .saturating_add(self.stale)
-            .saturating_add(self.active)
-            > 0
+        self.present().any(|(status, _, _)| status != "success")
     }
 }
 
@@ -319,13 +357,18 @@ fn delayed_line(delayed: Option<(i64, i64)>) -> Option<String> {
     })
 }
 
-fn delayed_digest_line(delayed: Option<(i64, i64)>) -> Option<String> {
-    delayed.map(|(due_ms, now_ms)| {
-        format!(
+fn delayed_digest_line(delayed: Option<(i64, i64)>, format: DigestFormat) -> Option<String> {
+    delayed.map(|(due_ms, now_ms)| match format {
+        DigestFormat::Discord => format!(
+            "⏰ **DELAYED DIGEST RETRY** — due {}, delivered {}",
+            digest_time(due_ms, format),
+            digest_time(now_ms, format)
+        ),
+        DigestFormat::Email => format!(
             "DELAYED DIGEST RETRY: digest was due at {}, delivered at {}",
             rfc3339(due_ms),
             rfc3339(now_ms)
-        )
+        ),
     })
 }
 
@@ -458,6 +501,31 @@ fn digest_display_field(value: &str) -> String {
     digest_field(value).unwrap_or_else(|| "[oversized]".to_string())
 }
 
+/// Neutralize the inline Discord markdown metacharacters so a job id, host or
+/// schedule label can never distort the rest of the embed. The oversize test
+/// still runs on the raw value, so escaping never changes what is admitted.
+fn discord_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '*' | '_' | '~' | '`' | '|' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn digest_text(value: &str, format: DigestFormat) -> Option<String> {
+    digest_field(value).map(|value| match format {
+        DigestFormat::Discord => discord_escape(&value),
+        DigestFormat::Email => value,
+    })
+}
+
+fn digest_display_text(value: &str, format: DigestFormat) -> String {
+    digest_text(value, format).unwrap_or_else(|| "[oversized]".to_string())
+}
+
 fn digest_time(start_ms: i64, format: DigestFormat) -> String {
     match format {
         DigestFormat::Discord => format!("<t:{}:f>", start_ms / 1000),
@@ -471,24 +539,33 @@ fn digest_duration(duration_ms: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn digest_status_counts(counts: DigestStatusCounts) -> String {
-    let entries = [
-        ("success", counts.success),
-        ("failure", counts.failure),
-        ("timeout", counts.timeout),
-        ("start_failed", counts.start_failed),
-        ("stale", counts.stale),
-        ("active", counts.active),
-    ];
-    let shown = entries
-        .into_iter()
-        .filter(|(_, count)| *count > 0)
-        .map(|(status, count)| format!("{status}={count}"))
+fn digest_status_counts(counts: DigestStatusCounts, format: DigestFormat) -> String {
+    let shown = counts
+        .present()
+        .map(|(status, icon, count)| match format {
+            DigestFormat::Discord => format!("{icon} {count} {}", status.replace('_', " ")),
+            DigestFormat::Email => format!("{status}={count}"),
+        })
         .collect::<Vec<_>>();
     if shown.is_empty() {
-        return "none".to_string();
+        return match format {
+            DigestFormat::Discord => "no executions".to_string(),
+            DigestFormat::Email => "none".to_string(),
+        };
     }
-    shown.join(", ")
+    shown.join(match format {
+        DigestFormat::Discord => " · ",
+        DigestFormat::Email => ", ",
+    })
+}
+
+/// Left-gutter icon for a job summary: the first problem status it recorded,
+/// so a digest can be scanned vertically for trouble.
+fn digest_job_icon(job: &DigestJobSummary) -> &'static str {
+    job.statuses
+        .present()
+        .find(|(status, _, _)| *status != "success")
+        .map_or_else(|| digest_status_icon("success"), |(_, icon, _)| icon)
 }
 
 fn digest_row_limit(total: u64, maximum: usize) -> usize {
@@ -558,15 +635,55 @@ fn digest_model(summary: &DigestSummary) -> DigestModel<'_> {
     }
 }
 
-fn digest_base_lines(ctx: &DigestMsgCtx<'_>) -> Vec<String> {
+fn digest_base_lines(ctx: &DigestMsgCtx<'_>, format: DigestFormat) -> Vec<String> {
+    match format {
+        DigestFormat::Discord => digest_discord_base_lines(ctx),
+        DigestFormat::Email => digest_email_base_lines(ctx),
+    }
+}
+
+/// Discord header: who and when on two quiet lines, then the totals. Each
+/// entry stays a whole line so the cap fitter can drop it without slicing, and
+/// an oversized host or period drops only its own fragment.
+fn digest_discord_base_lines(ctx: &DigestMsgCtx<'_>) -> Vec<String> {
+    let format = DigestFormat::Discord;
     let mut lines = Vec::new();
-    if let Some(delayed) = delayed_digest_line(ctx.delayed) {
+    if let Some(delayed) = delayed_digest_line(ctx.delayed, format) {
         lines.push(delayed);
     }
-    if let Some(host) = digest_field(ctx.recorded_host) {
+
+    let mut identity = Vec::new();
+    if let Some(host) = digest_text(ctx.recorded_host, format) {
+        identity.push(format!("**{host}**"));
+    }
+    if let Some(period) = digest_text(ctx.period, format) {
+        identity.push(period);
+    }
+    identity.push(format!(
+        "{} → {}",
+        digest_time(ctx.window_start_ms, format),
+        digest_time(ctx.window_end_ms, format)
+    ));
+    lines.push(format!("-# {}", identity.join(" · ")));
+    lines.push(format!(
+        "**{}** across **{}** · {}",
+        count_label(ctx.summary.total_executions, "execution", "executions"),
+        count_label(ctx.summary.total_jobs, "job", "jobs"),
+        digest_status_counts(ctx.summary.statuses, format)
+    ));
+    lines
+}
+
+fn digest_email_base_lines(ctx: &DigestMsgCtx<'_>) -> Vec<String> {
+    let format = DigestFormat::Email;
+    let mut lines = Vec::new();
+    if let Some(delayed) = delayed_digest_line(ctx.delayed, format) {
+        lines.push(delayed);
+    }
+    if let Some(host) = digest_text(ctx.recorded_host, format) {
         lines.push(format!("host: {host}"));
     }
-    if let Some(period) = digest_field(ctx.period) {
+    if let Some(period) = digest_text(ctx.period, format) {
         lines.push(format!("period: {period}"));
     }
     lines.push(format!(
@@ -578,7 +695,7 @@ fn digest_base_lines(ctx: &DigestMsgCtx<'_>) -> Vec<String> {
     lines.push(format!("executions: {}", ctx.summary.total_executions));
     lines.push(format!(
         "statuses: {}",
-        digest_status_counts(ctx.summary.statuses)
+        digest_status_counts(ctx.summary.statuses, format)
     ));
     lines
 }
@@ -588,6 +705,62 @@ fn digest_job_lines(
     format: DigestFormat,
     include_schedule: bool,
 ) -> Vec<String> {
+    match format {
+        DigestFormat::Discord => digest_discord_job_lines(job, include_schedule),
+        DigestFormat::Email => digest_email_job_lines(job, include_schedule),
+    }
+}
+
+/// Two lines per job: a bold headline carrying the outcome, then the stats as
+/// Discord subtext. The alternation is what makes a long digest scannable.
+fn digest_discord_job_lines(job: &DigestJobSummary, include_schedule: bool) -> Vec<String> {
+    let format = DigestFormat::Discord;
+    let mut headline = format!(
+        "{} **{}** · {}",
+        digest_job_icon(job),
+        digest_display_text(&job.job_id, format),
+        count_label(job.total_executions, "execution", "executions")
+    );
+    let present = job.statuses.present().collect::<Vec<_>>();
+    let headline_icon_says_it_all =
+        matches!(present.as_slice(), [(_, _, count)] if *count == job.total_executions);
+    if !headline_icon_says_it_all {
+        headline.push_str(&format!(
+            " · {}",
+            digest_status_counts(job.statuses, format)
+        ));
+    }
+
+    let mut stats = Vec::new();
+    if let Some(durations) = job.durations {
+        stats.push(format!("avg {}", format_duration_ms(durations.average_ms)));
+        stats.push(format!("max {}", format_duration_ms(durations.max_ms)));
+    }
+    let latest = &job.latest;
+    let mut latest_stat = format!(
+        "latest {} {}",
+        digest_status_icon(&latest.status),
+        digest_time(latest.start_ms, format)
+    );
+    if let Some(duration_ms) = latest.duration_ms {
+        latest_stat.push_str(&format!(" ({})", format_duration_ms(duration_ms)));
+    }
+    stats.push(latest_stat);
+    if include_schedule {
+        if let Some(schedule) = latest
+            .schedule_label
+            .as_deref()
+            .and_then(|label| digest_text(label, format))
+        {
+            stats.push(format!("schedule {schedule}"));
+        }
+    }
+
+    vec![headline, format!("-# {}", stats.join(" · "))]
+}
+
+fn digest_email_job_lines(job: &DigestJobSummary, include_schedule: bool) -> Vec<String> {
+    let format = DigestFormat::Email;
     let duration_line = match job.durations {
         Some(durations) => format!(
             "  duration: avg {}, max {}",
@@ -600,24 +773,24 @@ fn digest_job_lines(
     let latest = &job.latest;
     let mut latest_line = format!(
         "  latest: status={}; started={}; duration={}",
-        digest_display_field(&latest.status),
+        digest_display_text(&latest.status, format),
         digest_time(latest.start_ms, format),
         digest_duration(latest.duration_ms)
     );
     if include_schedule {
         if let Some(schedule) = &latest.schedule_label {
-            if let Some(schedule) = digest_field(schedule) {
+            if let Some(schedule) = digest_text(schedule, format) {
                 latest_line.push_str(&format!("; schedule={schedule}"));
             }
         }
     }
 
     vec![
-        format!("job: {}", digest_display_field(&job.job_id)),
+        format!("job: {}", digest_display_text(&job.job_id, format)),
         format!(
             "  executions: {}; statuses: {}",
             job.total_executions,
-            digest_status_counts(job.statuses)
+            digest_status_counts(job.statuses, format)
         ),
         duration_line,
         latest_line,
@@ -626,14 +799,29 @@ fn digest_job_lines(
 
 fn digest_execution_line(detail: &DigestExecutionDetail, format: DigestFormat) -> String {
     let short_id: String = detail.run_id.chars().take(8).collect();
-    format!(
-        "- {}/{}: status={}; started={}; duration={}",
-        digest_display_field(&detail.job_id),
-        digest_display_field(&short_id),
-        digest_display_field(&detail.status),
-        digest_time(detail.start_ms, format),
-        digest_duration(detail.duration_ms)
-    )
+    match format {
+        DigestFormat::Discord => {
+            let mut line = format!(
+                "- {} **{}** `{}` · {}",
+                digest_status_icon(&detail.status),
+                digest_display_text(&detail.job_id, format),
+                digest_display_field(&short_id),
+                digest_time(detail.start_ms, format)
+            );
+            if let Some(duration_ms) = detail.duration_ms {
+                line.push_str(&format!(" · {}", format_duration_ms(duration_ms)));
+            }
+            line
+        }
+        DigestFormat::Email => format!(
+            "- {}/{}: status={}; started={}; duration={}",
+            digest_display_text(&detail.job_id, format),
+            digest_display_text(&short_id, format),
+            digest_display_text(&detail.status, format),
+            digest_time(detail.start_ms, format),
+            digest_duration(detail.duration_ms)
+        ),
+    }
 }
 
 fn digest_omissions(ctx: &DigestMsgCtx<'_>, selection: &DigestSelection) -> (u64, u64) {
@@ -674,6 +862,15 @@ fn digest_footer_variants(omitted_jobs: u64, omitted_executions: u64) -> [String
     ]
 }
 
+/// A section break. Discord gets a blank line and a heading; email keeps the
+/// bare label it has always used, and has no heading above the job list.
+fn digest_section_header(format: DigestFormat, discord: &str, email: Option<&str>) -> Vec<String> {
+    match format {
+        DigestFormat::Discord => vec![String::new(), format!("### {discord}")],
+        DigestFormat::Email => email.map(str::to_string).into_iter().collect(),
+    }
+}
+
 fn digest_selected_lines(
     model: &DigestModel<'_>,
     base_lines: &[String],
@@ -687,19 +884,35 @@ fn digest_selected_lines(
         .map(|(line, _)| line.clone())
         .collect::<Vec<_>>();
 
+    let mut jobs_started = false;
     for (job, schedule) in model.jobs.iter().zip(&selection.job_schedules) {
-        if let Some(include_schedule) = schedule {
-            lines.extend(digest_job_lines(job, format, *include_schedule));
+        let Some(include_schedule) = schedule else {
+            continue;
+        };
+        if !jobs_started {
+            lines.extend(digest_section_header(format, "Jobs", None));
+            jobs_started = true;
+        } else if matches!(format, DigestFormat::Discord) {
+            lines.push(String::new());
         }
+        lines.extend(digest_job_lines(job, format, *include_schedule));
     }
     if selection.problem_count > 0 {
-        lines.push("problem executions:".to_string());
+        lines.extend(digest_section_header(
+            format,
+            "Problem executions",
+            Some("problem executions:"),
+        ));
         for detail in &model.problems[..selection.problem_count] {
             lines.push(digest_execution_line(detail, format));
         }
     }
     if selection.success_count > 0 {
-        lines.push("recent successes:".to_string());
+        lines.extend(digest_section_header(
+            format,
+            "Recent successes",
+            Some("recent successes:"),
+        ));
         for detail in &model.successes[..selection.success_count] {
             lines.push(digest_execution_line(detail, format));
         }
@@ -722,20 +935,27 @@ fn digest_body_for_selection(
         return (body.chars().count() <= cap).then_some(body);
     }
 
+    let gap = matches!(format, DigestFormat::Discord);
     for footer in digest_footer_variants(omitted_jobs, omitted_executions) {
+        if gap {
+            lines.push(String::new());
+        }
         lines.push(footer);
         let body = lines.join("\n");
         if body.chars().count() <= cap {
             return Some(body);
         }
         lines.pop();
+        if gap {
+            lines.pop();
+        }
     }
     None
 }
 
 fn digest_body(ctx: &DigestMsgCtx<'_>, format: DigestFormat, cap: usize) -> String {
     let model = digest_model(ctx.summary);
-    let base_lines = digest_base_lines(ctx);
+    let base_lines = digest_base_lines(ctx, format);
 
     // This all-data candidate is attempted only when exact totals prove the
     // already bounded input contains the complete cohort. Large cohorts never
@@ -1146,12 +1366,31 @@ events = ["failure", "recovery"]
             .to_string()
     }
 
-    fn assert_exact_omission_footer(body: &str, jobs: u64, executions: u64) {
-        let shown_jobs = body
-            .lines()
-            .filter(|line| line.starts_with("job: "))
-            .count() as u64;
-        let shown_executions = body.lines().filter(|line| line.starts_with("- ")).count() as u64;
+    /// What a rendered body actually shows. Email prefixes each job summary
+    /// with `job: `; Discord gives each one a `-# ` stats line inside its
+    /// `### Jobs` section. Execution details are list items in both formats.
+    fn digest_shown(body: &str, format: DigestFormat) -> (u64, u64) {
+        let jobs = match format {
+            DigestFormat::Email => body
+                .lines()
+                .filter(|line| line.starts_with("job: "))
+                .count(),
+            DigestFormat::Discord => body
+                .split("### ")
+                .find(|section| section.starts_with("Jobs"))
+                .map_or(0, |section| {
+                    section
+                        .lines()
+                        .filter(|line| line.starts_with("-# "))
+                        .count()
+                }),
+        };
+        let executions = body.lines().filter(|line| line.starts_with("- ")).count();
+        (jobs as u64, executions as u64)
+    }
+
+    fn assert_exact_omission_footer(body: &str, format: DigestFormat, jobs: u64, executions: u64) {
+        let (shown_jobs, shown_executions) = digest_shown(body, format);
         let omitted_jobs = jobs.saturating_sub(shown_jobs);
         let omitted_executions = executions.saturating_sub(shown_executions);
         let verbose = digest_footer_variants(omitted_jobs, omitted_executions)[0].clone();
@@ -1272,40 +1511,45 @@ events = ["failure", "recovery"]
         let embed = &discord["embeds"][0];
         assert_eq!(embed["title"], "DIGEST: daily");
         let description = embed["description"].as_str().unwrap();
-        assert!(description.contains("observed jobs: 2"), "{description}");
-        assert!(description.contains("executions: 5"), "{description}");
         assert!(
-            description.contains("statuses: success=3, failure=1, stale=1"),
+            description.contains("**5 executions** across **2 jobs**"),
             "{description}"
         );
+        assert!(
+            description.contains("✅ 3 success · ❌ 1 failure · ⚠️ 1 stale"),
+            "{description}"
+        );
+        assert!(description.contains("prod-worker-01"), "{description}");
 
-        let zeta = description.find("job: zeta").unwrap();
-        let alpha = description.find("job: alpha").unwrap();
+        let zeta = description.find("**zeta**").unwrap();
+        let alpha = description.find("**alpha**").unwrap();
         assert!(zeta < alpha, "problem jobs must sort first:\n{description}");
         let zeta_block = &description[zeta..alpha];
         assert!(
-            zeta_block.contains("executions: 3; statuses: success=1, failure=1, stale=1"),
+            zeta_block.contains("3 executions · ✅ 1 success · ❌ 1 failure · ⚠️ 1 stale"),
             "{zeta_block}"
         );
         assert!(
-            zeta_block.contains("duration: avg 3s, max 4s"),
+            zeta_block.contains("avg 3s · max 4s"),
             "detection timestamps must be excluded from duration stats:\n{zeta_block}"
         );
         assert!(
-            zeta_block.contains(
-                "latest: status=success; started=<t:1700000003:f>; duration=2s; schedule=daily import"
-            ),
+            zeta_block.contains("latest ✅ <t:1700000003:f> (2s) · schedule daily import"),
             "{zeta_block}"
         );
+        assert!(
+            description.contains("✅ **alpha** · 2 executions\n"),
+            "a single-status job needs no breakdown:\n{description}"
+        );
 
-        let problems = description.find("problem executions:").unwrap();
-        let successes = description.find("recent successes:").unwrap();
+        let problems = description.find("### Problem executions").unwrap();
+        let successes = description.find("### Recent successes").unwrap();
         assert!(problems > alpha && problems < successes, "{description}");
         assert!(
-            description.find("zeta/STALE001").unwrap() < description.find("zeta/FAIL0001").unwrap(),
+            description.find("STALE001").unwrap() < description.find("FAIL0001").unwrap(),
             "problem executions should be newest first:\n{description}"
         );
-        assert!(description.find("alpha/ALPHA002").unwrap() > successes);
+        assert!(description.find("ALPHA002").unwrap() > successes);
 
         let (subject, email) = digest_email_message(&ctx, None);
         assert_eq!(subject, "[uatu] DIGEST (daily) on prod-worker-01");
@@ -1369,7 +1613,7 @@ events = ["failure", "recovery"]
         let (discord_cap, discord) = (80..full.chars().count())
             .find_map(|cap| {
                 let body = discord_digest_description(&ctx, cap);
-                (body.contains("job: ") && body.contains("omitted:")).then_some((cap, body))
+                (body.contains("### Jobs") && body.contains("omitted:")).then_some((cap, body))
             })
             .expect("a partial semantic Discord rendering");
         assert!(discord.chars().count() <= discord_cap);
@@ -1377,12 +1621,13 @@ events = ["failure", "recovery"]
             !discord.contains('…'),
             "raw tail clipping returned:\n{discord}"
         );
-        assert_exact_omission_footer(&discord, 3, 15);
-        if discord.contains("recent successes:") {
+        assert_exact_omission_footer(&discord, DigestFormat::Discord, 3, 15);
+        if discord.contains("### Recent successes") {
+            let timeout_bullet = format!("- {}", digest_status_icon("timeout"));
             assert_eq!(
                 discord
                     .lines()
-                    .filter(|line| line.contains("status=timeout"))
+                    .filter(|line| line.starts_with(&timeout_bullet))
                     .count(),
                 2,
                 "success detail must only appear after every problem:\n{discord}"
@@ -1394,7 +1639,7 @@ events = ["failure", "recovery"]
         assert!(email.chars().count() <= email_cap, "{email}");
         assert!(email.contains("omitted:"), "{email}");
         assert!(!email.contains('…'), "{email}");
-        assert_exact_omission_footer(&email, 3, 15);
+        assert_exact_omission_footer(&email, DigestFormat::Email, 3, 15);
 
         // Exact metadata remains useful for cohorts far larger than the
         // bounded rows supplied to the renderer.
@@ -1429,13 +1674,15 @@ events = ["failure", "recovery"]
         let large_ctx = digest_ctx(&large);
         let discord = discord_digest_description(&large_ctx, usize::MAX);
         assert!(discord.chars().count() <= 4096);
-        assert!(discord.contains("observed jobs: 1000000"), "{discord}");
-        assert!(discord.contains("executions: 9000000000"), "{discord}");
         assert!(
-            discord.contains("statuses: success=8999999900, failure=100"),
+            discord.contains("**9000000000 executions** across **1000000 jobs**"),
             "{discord}"
         );
-        assert_exact_omission_footer(&discord, 1_000_000, 9_000_000_000);
+        assert!(
+            discord.contains("✅ 8999999900 success · ❌ 100 failure"),
+            "{discord}"
+        );
+        assert_exact_omission_footer(&discord, DigestFormat::Discord, 1_000_000, 9_000_000_000);
     }
 
     #[test]
@@ -1492,11 +1739,12 @@ events = ["failure", "recovery"]
         let body = discord_digest_description(&digest_ctx(&summary), usize::MAX);
         assert!(body.chars().count() <= 4096);
         assert!(
-            !body.contains("recent successes:"),
+            !body.contains("### Recent successes"),
             "success detail must wait until every exact problem detail is available:\n{body}"
         );
         assert_exact_omission_footer(
             &body,
+            DigestFormat::Discord,
             job_count as u64,
             (problem_count + success_count) as u64,
         );
@@ -1538,8 +1786,8 @@ events = ["failure", "recovery"]
         };
 
         let full = discord_digest_description(&ctx, 4096);
-        assert!(full.contains("job: café-東京-🧪"), "{full}");
-        assert!(full.contains("schedule=nuit 🌙 production"), "{full}");
+        assert!(full.contains("**café-東京-🧪**"), "{full}");
+        assert!(full.contains("schedule nuit 🌙 production"), "{full}");
         assert!(full.contains("🧪🧪🧪🧪🧪🧪🧪🧪"), "{full}");
         for cap in 0..80 {
             let body = discord_digest_description(&ctx, cap);
