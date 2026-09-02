@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.1.1-alpha.8] - 2026-09-02
+
+- deps: Lock file maintenance (#49)
+- chore: remove .DS_Store
+- feat(digest): render Discord digests with markdown structure (#48)
+- deps: Lock file maintenance (#47)
+
+
 ## [0.1.1-alpha.7] - 2026-08-19
 
 - Revert "chore: release v0.1.1-alpha.7 (#44)" (#45)
