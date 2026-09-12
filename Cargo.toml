@@ -18,14 +18,14 @@ lettre = { version = "0.11.23", default-features = false, features = ["smtp-tran
 libc = "0.2.189"
 rand = "0.10.2"
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 signal-hook = "0.4.4"
 tokio = { version = "1.53.1", features = ["rt", "time"] }
-toml = "1.1.5"
+toml = "1.1.6"
 ulid = "3.0.0"
 
 [dev-dependencies]
