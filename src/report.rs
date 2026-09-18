@@ -767,10 +767,10 @@ pub fn deliver_due(ctx: &DeliverCtx, me: &Liveness, deadline: Option<std::time::
         Err(_) => return,
     };
     for row in due {
-        if let Some(d) = deadline {
-            if std::time::Instant::now() >= d {
-                return; // remaining rows stay queued and due
-            }
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
+            return; // remaining rows stay queued and due
         }
         match with_state_deadline(ctx.db, deadline, || ctx.db.claim_delivery(row.id, me)) {
             Ok(true) => {}

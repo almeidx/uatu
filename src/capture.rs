@@ -12,14 +12,14 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::config::CaptureMode;
 use crate::db::CaptureMeta;
-use crate::redact::{LineAssembler, Redactor, LINE_BUF_CAP};
+use crate::redact::{LINE_BUF_CAP, LineAssembler, Redactor};
 
 pub struct CaptureTask {
     pub handle: JoinHandle<CaptureMeta>,

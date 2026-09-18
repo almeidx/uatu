@@ -6,12 +6,12 @@ use std::ffi::OsString;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::capture::{spawn_capture, CaptureSpec, CaptureTask};
+use crate::capture::{CaptureSpec, CaptureTask, spawn_capture};
 use crate::config::{self, CaptureMode, CliOverrides, Config, Effective};
 use crate::db::{CaptureMeta, Db, RunRow};
 use crate::events::{self, Event};
@@ -159,24 +159,23 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     // ----- storage preflight (SPEC §6) -----
     let mut capture_enabled = !metadata_only && eff.capture_mode != CaptureMode::Off;
     let mut preflight_note: Option<String> = None;
-    if capture_enabled {
-        if let Some(free) = state::free_bytes(&paths.state_dir) {
-            if free < eff.min_free_bytes {
-                capture_enabled = false;
-                let msg = format!(
-                    "free space {} below min_free_bytes {}; capture disabled for this run (metadata-only)",
-                    crate::util::format_bytes(free),
-                    crate::util::format_bytes(eff.min_free_bytes)
-                );
-                warn(&msg);
-                oplog.warn(
-                    "preflight_low_space",
-                    &msg,
-                    &[("run_id", serde_json::json!(run_id))],
-                );
-                preflight_note = Some("preflight: low free space".to_string());
-            }
-        }
+    if capture_enabled
+        && let Some(free) = state::free_bytes(&paths.state_dir)
+        && free < eff.min_free_bytes
+    {
+        capture_enabled = false;
+        let msg = format!(
+            "free space {} below min_free_bytes {}; capture disabled for this run (metadata-only)",
+            crate::util::format_bytes(free),
+            crate::util::format_bytes(eff.min_free_bytes)
+        );
+        warn(&msg);
+        oplog.warn(
+            "preflight_low_space",
+            &msg,
+            &[("run_id", serde_json::json!(run_id))],
+        );
+        preflight_note = Some("preflight: low free space".to_string());
     }
 
     // ----- signal handling -----
@@ -274,24 +273,24 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     );
 
     // ----- pre-start checks → 125 (SPEC §3) -----
-    if let Some(cwd) = &eff.cwd {
-        if !cwd.is_dir() {
-            let msg = format!("working directory {} does not exist", cwd.display());
-            return finish_start_failure(
-                &db,
-                &oplog,
-                &cfg,
-                &paths,
-                &me,
-                &run_id,
-                &job_id,
-                EXIT_INTERNAL,
-                &msg,
-                reporters_enabled,
-                db_ok,
-                &redactor,
-            );
-        }
+    if let Some(cwd) = &eff.cwd
+        && !cwd.is_dir()
+    {
+        let msg = format!("working directory {} does not exist", cwd.display());
+        return finish_start_failure(
+            &db,
+            &oplog,
+            &cfg,
+            &paths,
+            &me,
+            &run_id,
+            &job_id,
+            EXIT_INTERNAL,
+            &msg,
+            reporters_enabled,
+            db_ok,
+            &redactor,
+        );
     }
 
     // ----- spawn child in a new process group (SPEC §6) -----
@@ -329,11 +328,12 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     // ----- stream pumps + capture (SPEC §6) -----
     let run_dir = paths.run_output_dir(&job_id, &run_id);
     let mut capture_dir_err: Option<String> = None;
-    if capture_enabled && (eff.capture_stdout || eff.capture_stderr) {
-        if let Err(e) = state::mkdir_0700_all(&run_dir) {
-            capture_dir_err = Some(format!("cannot create output dir: {e}"));
-            capture_enabled = false;
-        }
+    if capture_enabled
+        && (eff.capture_stdout || eff.capture_stderr)
+        && let Err(e) = state::mkdir_0700_all(&run_dir)
+    {
+        capture_dir_err = Some(format!("cannot create output dir: {e}"));
+        capture_enabled = false;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let stdout_pipe = child.stdout.take().expect("stdout piped");
@@ -380,30 +380,31 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             let status = term_then_kill(&mut child, child_pid, eff.kill_grace);
             break status;
         }
-        if let Some(t) = timeout_at {
-            if Instant::now() >= t && !timeout_fired {
-                timeout_fired = true;
-                let status = term_then_kill(&mut child, child_pid, eff.kill_grace);
-                break status;
-            }
+        if let Some(t) = timeout_at
+            && Instant::now() >= t
+            && !timeout_fired
+        {
+            timeout_fired = true;
+            let status = term_then_kill(&mut child, child_pid, eff.kill_grace);
+            break status;
         }
-        if let Some(t) = long_run_at {
-            if Instant::now() >= t {
-                long_run_at = None; // once per run (SPEC §6)
-                long_run_thread = fire_long_run(
-                    &paths.db,
-                    &cfg,
-                    &run_id,
-                    &job_id,
-                    &redactor,
-                    reporters_enabled,
-                    eff.expected_from_cli,
-                    &oplog,
-                    db_ok,
-                );
-                if db_ok {
-                    let _ = db.set_long_run_fired(&run_id);
-                }
+        if let Some(t) = long_run_at
+            && Instant::now() >= t
+        {
+            long_run_at = None; // once per run (SPEC §6)
+            long_run_thread = fire_long_run(
+                &paths.db,
+                &cfg,
+                &run_id,
+                &job_id,
+                &redactor,
+                reporters_enabled,
+                eff.expected_from_cli,
+                &oplog,
+                db_ok,
+            );
+            if db_ok {
+                let _ = db.set_long_run_fired(&run_id);
             }
         }
     };
@@ -468,8 +469,8 @@ pub fn cmd_run(args: RunArgs) -> i32 {
 
     // ----- final record -----
     let end_ms = now_ms();
-    if db_ok {
-        if let Err(e) = db.finish_run(
+    if db_ok
+        && let Err(e) = db.finish_run(
             &run_id,
             status_str,
             end_ms,
@@ -481,10 +482,10 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             detached,
             &stdout_meta,
             &stderr_meta,
-        ) {
-            warn(&format!("cannot record run result: {e}"));
-            db_ok = false;
-        }
+        )
+    {
+        warn(&format!("cannot record run result: {e}"));
+        db_ok = false;
     }
     oplog.info(
         "run_finished",
@@ -503,13 +504,13 @@ pub fn cmd_run(args: RunArgs) -> i32 {
         match status_str {
             "success" => {
                 events_to_send.push(Event::Success);
-                if let Ok(Some(prev)) = db.last_terminal_status_before(&job_id, start_ms, &run_id) {
-                    if matches!(
+                if let Ok(Some(prev)) = db.last_terminal_status_before(&job_id, start_ms, &run_id)
+                    && matches!(
                         prev.as_str(),
                         "failure" | "timeout" | "stale" | "start_failed"
-                    ) {
-                        events_to_send.push(Event::Recovery);
-                    }
+                    )
+                {
+                    events_to_send.push(Event::Recovery);
                 }
             }
             "failure" | "timeout" => events_to_send.push(Event::Failure),
@@ -534,10 +535,10 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     // Collect a completed long_run sender without waiting past the child path.
     // An unfinished sender remains owner-scoped and is requeued as an orphan
     // after this wrapper exits (at-least-once is fine).
-    if let Some(t) = long_run_thread {
-        if t.is_finished() {
-            let _ = t.join();
-        }
+    if let Some(t) = long_run_thread
+        && t.is_finished()
+    {
+        let _ = t.join();
     }
 
     wrapper_exit
@@ -573,14 +574,14 @@ fn run_passthrough(
     reporters_enabled: bool,
     _oplog: &OpLog,
 ) -> i32 {
-    if let Some(cwd) = &eff.cwd {
-        if !cwd.is_dir() {
-            eprintln!(
-                "uatu: error: working directory {} does not exist",
-                cwd.display()
-            );
-            return EXIT_INTERNAL;
-        }
+    if let Some(cwd) = &eff.cwd
+        && !cwd.is_dir()
+    {
+        eprintln!(
+            "uatu: error: working directory {} does not exist",
+            cwd.display()
+        );
+        return EXIT_INTERNAL;
     }
     let (sig_tx, sig_rx) = mpsc::channel::<i32>();
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -623,11 +624,12 @@ fn run_passthrough(
         if sig_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
             break term_then_kill(&mut child, child_pid, eff.kill_grace);
         }
-        if let Some(t) = timeout_at {
-            if Instant::now() >= t && !timeout_fired {
-                timeout_fired = true;
-                break term_then_kill(&mut child, child_pid, eff.kill_grace);
-            }
+        if let Some(t) = timeout_at
+            && Instant::now() >= t
+            && !timeout_fired
+        {
+            timeout_fired = true;
+            break term_then_kill(&mut child, child_pid, eff.kill_grace);
         }
     };
     if let Some(h) = handle {
@@ -1110,10 +1112,9 @@ fn deliver_run_events(
     if !overall_deadline
         .saturating_duration_since(Instant::now())
         .is_zero()
+        && let Ok(Some(_guard)) = lock::try_acquire(&paths.lock)
     {
-        if let Ok(Some(_guard)) = lock::try_acquire(&paths.lock) {
-            report::deliver_due(&ctx, me, Some(overall_deadline));
-        }
+        report::deliver_due(&ctx, me, Some(overall_deadline));
     }
 }
 

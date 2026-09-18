@@ -293,10 +293,10 @@ impl Config {
             }
         }
         for s in self.smtp.values() {
-            if let Some(p) = &s.password {
-                if !p.is_empty() {
-                    v.push(p.clone());
-                }
+            if let Some(p) = &s.password
+                && !p.is_empty()
+            {
+                v.push(p.clone());
             }
         }
         v
@@ -492,12 +492,12 @@ fn parse_tables(
         warnings,
     );
     cfg.jobs = parse_named_entries(get_table(doc, "jobs"), "jobs", warnings);
-    if let Some(t) = cfg.log.trim.as_deref() {
-        if t != "head" {
-            warnings.push(format!(
-                "config: log.trim={t:?} is not supported (only \"head\"); using \"head\""
-            ));
-        }
+    if let Some(t) = cfg.log.trim.as_deref()
+        && t != "head"
+    {
+        warnings.push(format!(
+            "config: log.trim={t:?} is not supported (only \"head\"); using \"head\""
+        ));
     }
     cfg
 }

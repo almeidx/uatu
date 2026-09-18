@@ -1322,9 +1322,10 @@ recipients = ["ops@test.local"]
     assert!(common::wait_until(Duration::from_secs(2), || smtp
         .message_count()
         == 1));
-    assert!(smtp
-        .last_message()
-        .contains("Subject: [uatu] TEST: smtp.ops on"));
+    assert!(
+        smtp.last_message()
+            .contains("Subject: [uatu] TEST: smtp.ops on")
+    );
     // Not queued for retry: no delivery rows at all.
     env.run_ok(&["run", "--", "true"]); // ensure db exists
     let db = env.db();

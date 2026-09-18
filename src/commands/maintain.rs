@@ -10,7 +10,7 @@ use crate::config::{self, SmtpTls};
 use crate::events::{self, Event};
 use crate::lock;
 use crate::redact::Redactor;
-use crate::report::{per_reporter_budget, SendOutcome, Sender};
+use crate::report::{SendOutcome, Sender, per_reporter_budget};
 use crate::util::{format_bytes, format_duration_ms};
 
 // ----- prune -----
@@ -179,11 +179,11 @@ pub fn cmd_init(args: InitArgs) -> i32 {
         return 1;
     }
     // Config will hold webhook URLs / SMTP passwords: 0700 dir, 0600 file (SPEC §7 spirit).
-    if let Some(parent) = target.parent() {
-        if let Err(e) = crate::state::mkdir_0700_all(parent) {
-            eprintln!("uatu: error: cannot create {}: {e}", parent.display());
-            return 1;
-        }
+    if let Some(parent) = target.parent()
+        && let Err(e) = crate::state::mkdir_0700_all(parent)
+    {
+        eprintln!("uatu: error: cannot create {}: {e}", parent.display());
+        return 1;
     }
     match crate::state::write_0600(&target, SAMPLE_CONFIG.as_bytes()) {
         Ok(()) => {
@@ -206,7 +206,9 @@ pub struct ValidateArgs {
 
 pub fn cmd_validate(args: ValidateArgs) -> i32 {
     let Some(path) = config::resolve_config_path(args.config.as_deref()) else {
-        eprintln!("uatu: error: no config file found (searched --config, $XDG_CONFIG_HOME/uatu/uatu.toml, ~/.config/uatu/uatu.toml, /etc/uatu/uatu.toml)");
+        eprintln!(
+            "uatu: error: no config file found (searched --config, $XDG_CONFIG_HOME/uatu/uatu.toml, ~/.config/uatu/uatu.toml, /etc/uatu/uatu.toml)"
+        );
         return 1;
     };
     println!("validating {}", path.display());
@@ -319,14 +321,14 @@ pub fn cmd_validate(args: ValidateArgs) -> i32 {
             warn_inert_digest_event(ev, &format!("jobs.{job}"), &mut warnings);
         }
         // expected_duration > timeout is almost certainly a mistake (SPEC §3).
-        if let (Some(exp), Some(timeout)) = (j.expected_duration, j.timeout) {
-            if exp.0 > timeout.0 {
-                warnings.push(format!(
+        if let (Some(exp), Some(timeout)) = (j.expected_duration, j.timeout)
+            && exp.0 > timeout.0
+        {
+            warnings.push(format!(
                     "jobs.{job}: expected_duration ({}) exceeds timeout ({}); the long_run alert can never fire",
                     format_duration_ms(exp.0.as_millis() as u64),
                     format_duration_ms(timeout.0.as_millis() as u64),
                 ));
-            }
         }
         // Execution-affecting keys notice (SPEC §3).
         let mut affecting = Vec::new();
@@ -526,9 +528,5 @@ pub fn cmd_notify_test(args: NotifyTestArgs) -> i32 {
             }
         }
     }
-    if failed {
-        1
-    } else {
-        0
-    }
+    if failed { 1 } else { 0 }
 }

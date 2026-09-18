@@ -382,10 +382,10 @@ fn common_lines(ctx: &MsgCtx) -> Vec<String> {
     if let Some(label) = &run.schedule_label {
         lines.push(format!("schedule: {label}"));
     }
-    if let Some(d) = run.duration_ms() {
-        if !run.end_is_detection {
-            lines.push(format!("duration: {}", format_duration_ms(d.max(0) as u64)));
-        }
+    if let Some(d) = run.duration_ms()
+        && !run.end_is_detection
+    {
+        lines.push(format!("duration: {}", format_duration_ms(d.max(0) as u64)));
     }
     if ctx.event == Event::Stale {
         lines.push(format!(
@@ -393,13 +393,13 @@ fn common_lines(ctx: &MsgCtx) -> Vec<String> {
             rfc3339(run.end_ms.unwrap_or(run.start_ms))
         ));
     }
-    if ctx.event == Event::LongRun {
-        if let Some(exp) = run.expected_duration_ms {
-            lines.push(format!(
-                "still running past expected duration ({})",
-                format_duration_ms(exp.max(0) as u64)
-            ));
-        }
+    if ctx.event == Event::LongRun
+        && let Some(exp) = run.expected_duration_ms
+    {
+        lines.push(format!(
+            "still running past expected duration ({})",
+            format_duration_ms(exp.max(0) as u64)
+        ));
     }
     if let Some(by) = &run.interrupted_by {
         lines.push(format!("wrapper interrupted by: {by}"));
@@ -746,14 +746,13 @@ fn digest_discord_job_lines(job: &DigestJobSummary, include_schedule: bool) -> V
         latest_stat.push_str(&format!(" ({})", format_duration_ms(duration_ms)));
     }
     stats.push(latest_stat);
-    if include_schedule {
-        if let Some(schedule) = latest
+    if include_schedule
+        && let Some(schedule) = latest
             .schedule_label
             .as_deref()
             .and_then(|label| digest_text(label, format))
-        {
-            stats.push(format!("schedule {schedule}"));
-        }
+    {
+        stats.push(format!("schedule {schedule}"));
     }
 
     vec![headline, format!("-# {}", stats.join(" · "))]
@@ -777,12 +776,11 @@ fn digest_email_job_lines(job: &DigestJobSummary, include_schedule: bool) -> Vec
         digest_time(latest.start_ms, format),
         digest_duration(latest.duration_ms)
     );
-    if include_schedule {
-        if let Some(schedule) = &latest.schedule_label {
-            if let Some(schedule) = digest_text(schedule, format) {
-                latest_line.push_str(&format!("; schedule={schedule}"));
-            }
-        }
+    if include_schedule
+        && let Some(schedule) = &latest.schedule_label
+        && let Some(schedule) = digest_text(schedule, format)
+    {
+        latest_line.push_str(&format!("; schedule={schedule}"));
     }
 
     vec![

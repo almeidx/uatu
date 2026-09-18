@@ -1,7 +1,7 @@
 [package]
 name = "uatu"
 version = "0.1.1-alpha.9"
-edition = "2021"
+edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 description = "Observe cron jobs without replacing cron: wrap commands, keep history, get alerts"

@@ -74,11 +74,7 @@ fn sanitize_basename(raw: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() {
-        "cmd".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "cmd".to_string() } else { s }
 }
 
 pub fn new_run_id() -> String {
@@ -111,9 +107,10 @@ mod tests {
         assert!(a.starts_with("backup-"));
         let hash = a.rsplit('-').next().unwrap();
         assert_eq!(hash.len(), 12);
-        assert!(hash
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
     }
 
     #[test]

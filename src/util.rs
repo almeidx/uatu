@@ -29,7 +29,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         _ => {
             return Err(format!(
                 "invalid duration \"{s}\": unknown unit \"{unit}\" (use ms, s, m, h, d)"
-            ))
+            ));
         }
     };
     let ms = n
@@ -59,7 +59,7 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
         u => {
             return Err(format!(
                 "invalid byte size \"{s}\": unknown unit \"{u}\" (use KiB, MiB, GiB, KB, MB, GB)"
-            ))
+            ));
         }
     };
     n.checked_mul(mult)
@@ -139,10 +139,10 @@ pub fn hostname() -> String {
     let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if r == 0 {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        if let Ok(s) = std::str::from_utf8(&buf[..end]) {
-            if !s.is_empty() {
-                return s.to_string();
-            }
+        if let Ok(s) = std::str::from_utf8(&buf[..end])
+            && !s.is_empty()
+        {
+            return s.to_string();
         }
     }
     "unknown-host".to_string()
@@ -154,10 +154,10 @@ pub fn expand_tilde(path: &str) -> std::path::PathBuf {
         if let Some(home) = std::env::var_os("HOME") {
             return std::path::PathBuf::from(home);
         }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::Path::new(&home).join(rest);
-        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::Path::new(&home).join(rest);
     }
     std::path::PathBuf::from(path)
 }

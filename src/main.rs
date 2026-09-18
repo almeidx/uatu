@@ -8,16 +8,16 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
-use uatu::commands::configure::{cmd_configure, ConfigureArgs};
-use uatu::commands::flush::{cmd_flush, FlushArgs};
+use uatu::commands::configure::{ConfigureArgs, cmd_configure};
+use uatu::commands::flush::{FlushArgs, cmd_flush};
 use uatu::commands::inspect::{
-    cmd_history, cmd_show, cmd_status, HistoryArgs, ShowArgs, StatusArgs,
+    HistoryArgs, ShowArgs, StatusArgs, cmd_history, cmd_show, cmd_status,
 };
 use uatu::commands::maintain::{
-    cmd_cron_example, cmd_init, cmd_notify_test, cmd_prune, cmd_validate, CronExampleArgs,
-    InitArgs, NotifyTestArgs, PruneArgs, ValidateArgs,
+    CronExampleArgs, InitArgs, NotifyTestArgs, PruneArgs, ValidateArgs, cmd_cron_example, cmd_init,
+    cmd_notify_test, cmd_prune, cmd_validate,
 };
-use uatu::commands::run::{cmd_run, RunArgs};
+use uatu::commands::run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
 #[command(

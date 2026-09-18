@@ -194,10 +194,10 @@ impl<R: BufRead, W: Write> Ui for LinePrompt<R, W> {
             if line.is_empty() {
                 return Ok(default);
             }
-            if let Ok(n) = line.parse::<usize>() {
-                if (1..=options.len()).contains(&n) {
-                    return Ok(n - 1);
-                }
+            if let Ok(n) = line.parse::<usize>()
+                && (1..=options.len()).contains(&n)
+            {
+                return Ok(n - 1);
             }
             if let Some(i) = options.iter().position(|o| o.eq_ignore_ascii_case(line)) {
                 return Ok(i);
@@ -305,10 +305,10 @@ impl Ui for TermUi {
 
     fn text(&mut self, question: &str, default: Option<&str>) -> PromptResult<String> {
         let mut t = Text::new(question);
-        if let Some(d) = default {
-            if !d.is_empty() {
-                t = t.with_default(d);
-            }
+        if let Some(d) = default
+            && !d.is_empty()
+        {
+            t = t.with_default(d);
         }
         t.prompt().map_err(map_err)
     }

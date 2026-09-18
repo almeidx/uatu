@@ -16,12 +16,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::commands::maintain::{cmd_notify_test, NotifyTestArgs};
+use crate::commands::maintain::{NotifyTestArgs, cmd_notify_test};
 use crate::config::{
-    self, ByteSize, CaptureMode, Config, DigestPeriod, DiscordCfg, Dur, JobCfg, SmtpCfg, SmtpTls,
-    ALL_DIGEST_PERIODS, DEFAULT_EVENTS,
+    self, ALL_DIGEST_PERIODS, ByteSize, CaptureMode, Config, DEFAULT_EVENTS, DigestPeriod,
+    DiscordCfg, Dur, JobCfg, SmtpCfg, SmtpTls,
 };
-use crate::events::{Event, ALL_EVENTS};
+use crate::events::{ALL_EVENTS, Event};
 use crate::identity::valid_slug;
 use crate::prompt::{self, LinePrompt, PromptError, PromptResult, TermUi, Ui};
 use crate::state;
@@ -108,11 +108,11 @@ pub fn cmd_configure(args: ConfigureArgs) -> i32 {
     };
 
     let rendered = render_config(&cfg);
-    if let Some(parent) = target.parent() {
-        if let Err(e) = state::mkdir_0700_all(parent) {
-            eprintln!("uatu: error: cannot create {}: {e}", parent.display());
-            return 1;
-        }
+    if let Some(parent) = target.parent()
+        && let Err(e) = state::mkdir_0700_all(parent)
+    {
+        eprintln!("uatu: error: cannot create {}: {e}", parent.display());
+        return 1;
     }
     if existed {
         let bak = backup_path(&target);

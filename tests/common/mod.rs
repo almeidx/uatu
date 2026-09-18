@@ -287,10 +287,10 @@ fn handle_http(
         if l.is_empty() {
             break;
         }
-        if let Some((k, v)) = l.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
+        if let Some((k, v)) = l.split_once(':')
+            && k.eq_ignore_ascii_case("content-length")
+        {
+            content_length = v.trim().parse().unwrap_or(0);
         }
     }
     let mut body = vec![0u8; content_length];
@@ -301,13 +301,15 @@ fn handle_http(
         hits.lock().unwrap().push(v);
     }
     let response = match behavior {
-        Behavior::Ok => "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string(),
+        Behavior::Ok => {
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
+        }
         Behavior::RateLimited(secs) => format!(
             "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {secs}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         ),
-        Behavior::Status(code) => format!(
-            "HTTP/1.1 {code} Oops\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-        ),
+        Behavior::Status(code) => {
+            format!("HTTP/1.1 {code} Oops\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+        }
         Behavior::Hang(d) => {
             std::thread::sleep(d);
             "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()

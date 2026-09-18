@@ -6,7 +6,7 @@
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::util::now_ms;
 
@@ -2070,11 +2070,9 @@ pub fn prune(
     }
 
     // Clear out empty per-job directories left behind.
-    if !dry_run {
-        if let Ok(entries) = std::fs::read_dir(output_root) {
-            for e in entries.flatten() {
-                let _ = std::fs::remove_dir(e.path()); // fails unless empty — fine
-            }
+    if !dry_run && let Ok(entries) = std::fs::read_dir(output_root) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_dir(e.path()); // fails unless empty — fine
         }
     }
     Ok(report)
@@ -2088,10 +2086,10 @@ fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            if let Ok(md) = e.metadata() {
-                if md.is_file() {
-                    total += md.len();
-                }
+            if let Ok(md) = e.metadata()
+                && md.is_file()
+            {
+                total += md.len();
             }
         }
     }
@@ -2460,11 +2458,12 @@ PRAGMA user_version=3;
         let cands = db.resolve_run_prefix("01AB").unwrap().unwrap_err();
         assert_eq!(cands.len(), 2);
         // not found
-        assert!(db
-            .resolve_run_prefix("9999")
-            .unwrap()
-            .unwrap_err()
-            .is_empty());
+        assert!(
+            db.resolve_run_prefix("9999")
+                .unwrap()
+                .unwrap_err()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3227,10 +3226,12 @@ PRAGMA user_version=3;
         );
         let other_late = db.get_delivery(other_late_id).unwrap().unwrap();
         assert_eq!(other_late.state, "expired");
-        assert!(other_late
-            .last_error
-            .unwrap()
-            .contains("before late membership"));
+        assert!(
+            other_late
+                .last_error
+                .unwrap()
+                .contains("before late membership")
+        );
 
         db.insert_run(&mk_run("R5", "job-e", "success", 500))
             .unwrap();
@@ -3334,15 +3335,19 @@ PRAGMA user_version=3;
             .iter()
             .map(|job| job.job_id.as_str())
             .collect();
-        assert!(aggregate
-            .problem_details
-            .iter()
-            .all(|detail| shown.contains(detail.job_id.as_str())));
+        assert!(
+            aggregate
+                .problem_details
+                .iter()
+                .all(|detail| shown.contains(detail.job_id.as_str()))
+        );
         assert_eq!(aggregate.success_details[0].job_id, "job-069");
-        assert!(aggregate
-            .success_details
-            .iter()
-            .any(|detail| !shown.contains(detail.job_id.as_str())));
+        assert!(
+            aggregate
+                .success_details
+                .iter()
+                .any(|detail| !shown.contains(detail.job_id.as_str()))
+        );
     }
 
     #[test]
