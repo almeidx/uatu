@@ -11,9 +11,9 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm", "fuzzy"] }
-jiff = "0.2.35"
+jiff = "0.2.37"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 libc = "0.2.189"
 rand = "0.10.2"
