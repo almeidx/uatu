@@ -231,11 +231,12 @@ that missed runs were detected. Digests never replace or suppress configured
 immediate alerts: immediate network attempts run first, with at most 250ms of
 the existing post-child budget reserved to persist digest membership.
 
-Message limits keep complete summary lines, prioritize problem jobs and
-problem executions before recent successes, and end with exact omitted-job and
-omitted-execution-detail counts when necessary. Once a cohort is delivered or
-expires, an execution recorded later for that same closed UTC window remains
-in local history but does not open a second digest.
+Message limits keep complete summary lines and prioritize problem jobs and
+problem executions before up to three recent successes. Digests end with exact
+omitted-job-summary and omitted-execution-detail counts when necessary; these
+executions are still included in the aggregate totals. Once a cohort is
+delivered or expires, an execution recorded later for that same closed UTC
+window remains in local history but does not open a second digest.
 
 Timeouts report as `failure` events with timeout detail. `--expected-duration`
 sends one mid-run `long_run` alert (the CLI flag implies the alert; from

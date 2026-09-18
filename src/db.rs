@@ -138,7 +138,7 @@ pub struct DeliveryDigest {
 
 pub const DIGEST_JOB_SUMMARY_LIMIT: usize = 64;
 pub const DIGEST_PROBLEM_DETAIL_LIMIT: usize = 128;
-pub const DIGEST_SUCCESS_DETAIL_LIMIT: usize = 64;
+pub const DIGEST_SUCCESS_DETAIL_LIMIT: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct DigestCohortRow {
@@ -3321,6 +3321,14 @@ PRAGMA user_version=3;
         assert_eq!(aggregate.job_summaries.len(), DIGEST_JOB_SUMMARY_LIMIT);
         assert_eq!(aggregate.problem_details.len(), DIGEST_PROBLEM_DETAIL_LIMIT);
         assert_eq!(aggregate.success_details.len(), DIGEST_SUCCESS_DETAIL_LIMIT);
+        assert_eq!(
+            aggregate
+                .success_details
+                .iter()
+                .map(|detail| detail.start_ms)
+                .collect::<Vec<_>>(),
+            vec![694, 693, 684],
+        );
         let shown: std::collections::HashSet<&str> = aggregate
             .job_summaries
             .iter()

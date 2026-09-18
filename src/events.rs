@@ -183,7 +183,7 @@ pub struct MsgCtx<'a> {
 /// defensively so its work stays bounded even for an invalid caller.
 pub const DIGEST_MAX_JOB_SUMMARIES: usize = 64;
 pub const DIGEST_MAX_PROBLEM_DETAILS: usize = 128;
-pub const DIGEST_MAX_SUCCESS_DETAILS: usize = 64;
+pub const DIGEST_MAX_SUCCESS_DETAILS: usize = 3;
 
 /// Exact counts for the finite run-status vocabulary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -802,7 +802,7 @@ fn digest_execution_line(detail: &DigestExecutionDetail, format: DigestFormat) -
     match format {
         DigestFormat::Discord => {
             let mut line = format!(
-                "- {} **{}** `{}` · {}",
+                "{} **{}** `{}` · {}",
                 digest_status_icon(&detail.status),
                 digest_display_text(&detail.job_id, format),
                 digest_display_field(&short_id),
@@ -852,12 +852,19 @@ fn count_label(count: u64, singular: &str, plural: &str) -> String {
 }
 
 fn digest_footer_variants(omitted_jobs: u64, omitted_executions: u64) -> [String; 2] {
+    let mut omitted = Vec::new();
+    if omitted_jobs > 0 {
+        omitted.push(count_label(omitted_jobs, "job summary", "job summaries"));
+    }
+    if omitted_executions > 0 {
+        omitted.push(count_label(
+            omitted_executions,
+            "execution detail",
+            "execution details",
+        ));
+    }
     [
-        format!(
-            "omitted: {}, {} (message cap)",
-            count_label(omitted_jobs, "job", "jobs"),
-            count_label(omitted_executions, "execution", "executions")
-        ),
+        format!("omitted: {}", omitted.join(", ")),
         format!("omitted: jobs={omitted_jobs}, executions={omitted_executions}"),
     ]
 }
@@ -1368,7 +1375,8 @@ events = ["failure", "recovery"]
 
     /// What a rendered body actually shows. Email prefixes each job summary
     /// with `job: `; Discord gives each one a `-# ` stats line inside its
-    /// `### Jobs` section. Execution details are list items in both formats.
+    /// `### Jobs` section. Discord execution details have inline run IDs;
+    /// email execution details are list items.
     fn digest_shown(body: &str, format: DigestFormat) -> (u64, u64) {
         let jobs = match format {
             DigestFormat::Email => body
@@ -1385,7 +1393,13 @@ events = ["failure", "recovery"]
                         .count()
                 }),
         };
-        let executions = body.lines().filter(|line| line.starts_with("- ")).count();
+        let executions = body
+            .lines()
+            .filter(|line| match format {
+                DigestFormat::Discord => line.contains("** `"),
+                DigestFormat::Email => line.starts_with("- "),
+            })
+            .count();
         (jobs as u64, executions as u64)
     }
 
@@ -1558,6 +1572,68 @@ events = ["failure", "recovery"]
     }
 
     #[test]
+    fn digest_limits_recent_successes_and_keeps_discord_details_out_of_lists() {
+        let base = 1_700_000_000_000;
+        let summary = DigestSummary {
+            total_jobs: 1,
+            total_executions: 75,
+            statuses: counts(40, 35, 0, 0, 0),
+            total_problem_executions: 35,
+            total_success_executions: 40,
+            job_summaries: vec![job(
+                "nightly",
+                75,
+                counts(40, 35, 0, 0, 0),
+                Some((1_000, 1_000)),
+                latest("success", base + 39_000, Some(1_000), None),
+            )],
+            problem_details: (0..35)
+                .map(|index| {
+                    detail(
+                        "nightly",
+                        &format!("FAIL{index:04}"),
+                        "failure",
+                        base + index * 1_000,
+                        Some(1_000),
+                    )
+                })
+                .collect(),
+            success_details: (0..40)
+                .rev()
+                .map(|index| {
+                    detail(
+                        "nightly",
+                        &format!("GOOD{index:04}"),
+                        "success",
+                        base + index * 1_000,
+                        Some(1_000),
+                    )
+                })
+                .collect(),
+        };
+        let ctx = digest_ctx(&summary);
+        let discord = discord_digest_description(&ctx, 4096);
+        assert!(discord.contains("**75 executions** across **1 job**"));
+        assert!(discord.contains("✅ 40 success · ❌ 35 failure"));
+        assert!(discord.lines().all(|line| !line.starts_with("- ")));
+        let (_, email) = digest_email_message(&ctx, None);
+        for (body, format) in [
+            (&discord, DigestFormat::Discord),
+            (&email, DigestFormat::Email),
+        ] {
+            assert_eq!(digest_shown(body, format), (1, 38), "{body}");
+            assert_eq!(body.matches("GOOD").count(), 3, "{body}");
+            let newest = body.find("GOOD0039").unwrap();
+            let second = body.find("GOOD0038").unwrap();
+            let third = body.find("GOOD0037").unwrap();
+            assert!(newest < second && second < third, "{body}");
+            assert!(body.ends_with("omitted: 37 execution details"), "{body}");
+            assert!(!body.contains("message cap"), "{body}");
+            assert_exact_omission_footer(body, format, 1, 75);
+        }
+    }
+
+    #[test]
     fn digest_caps_keep_semantic_lines_and_exact_omission_counts() {
         let base = 1_700_000_000_000;
         let mut job_summaries = Vec::new();
@@ -1608,7 +1684,7 @@ events = ["failure", "recovery"]
         };
         let ctx = digest_ctx(&summary);
         let full = discord_digest_description(&ctx, 4096);
-        assert!(!full.contains("omitted:"), "fixture must fit at 4096");
+        assert!(full.ends_with("omitted: 10 execution details"), "{full}");
 
         let (discord_cap, discord) = (80..full.chars().count())
             .find_map(|cap| {
@@ -1623,11 +1699,11 @@ events = ["failure", "recovery"]
         );
         assert_exact_omission_footer(&discord, DigestFormat::Discord, 3, 15);
         if discord.contains("### Recent successes") {
-            let timeout_bullet = format!("- {}", digest_status_icon("timeout"));
+            let timeout_line = format!("{} **", digest_status_icon("timeout"));
             assert_eq!(
                 discord
                     .lines()
-                    .filter(|line| line.starts_with(&timeout_bullet))
+                    .filter(|line| line.starts_with(&timeout_line) && line.contains("** `"))
                     .count(),
                 2,
                 "success detail must only appear after every problem:\n{discord}"
