@@ -183,8 +183,8 @@ pub fn spawn_capture(
     redactor: Arc<Redactor>,
     rx: Receiver<Vec<u8>>,
     raw_total: Arc<AtomicU64>,
-) -> CaptureTask {
-    let handle = std::thread::spawn(move || {
+) -> std::io::Result<CaptureTask> {
+    let handle = crate::worker::spawn("uatu-capture", move || {
         let file = if spec.mode == CaptureMode::Off {
             None
         } else {
@@ -243,8 +243,8 @@ pub fn spawn_capture(
         let mut meta = sink.finalize();
         meta.bytes_total = raw_total.load(Ordering::SeqCst);
         meta
-    });
-    CaptureTask { handle }
+    })?;
+    Ok(CaptureTask { handle })
 }
 
 fn drain(sink: &mut Sink, redactor: &Redactor, rx: Receiver<Vec<u8>>) {
@@ -291,7 +291,8 @@ mod tests {
             Arc::new(redactor),
             rx,
             raw,
-        );
+        )
+        .unwrap();
         for c in chunks {
             tx.send(c).unwrap();
         }
@@ -373,7 +374,8 @@ mod tests {
             Arc::new(Redactor::empty()),
             rx,
             raw,
-        );
+        )
+        .unwrap();
         tx.send(b"hello\n".to_vec()).unwrap();
         drop(tx);
         let meta = task.handle.join().unwrap();

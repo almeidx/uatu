@@ -124,11 +124,11 @@ fn queue_digest_for_run_inner(
 /// `attempts_failed` is the total failures so far (≥1).
 pub fn backoff_base(attempts_failed: i64) -> Duration {
     match attempts_failed {
-        i64::MIN..=1 => Duration::from_secs(60),
-        2 => Duration::from_secs(5 * 60),
-        3 => Duration::from_secs(25 * 60),
-        4 => Duration::from_secs(2 * 3600),
-        _ => Duration::from_secs(6 * 3600),
+        i64::MIN..=1 => Duration::from_mins(1),
+        2 => Duration::from_mins(5),
+        3 => Duration::from_mins(25),
+        4 => Duration::from_hours(2),
+        _ => Duration::from_hours(6),
     }
 }
 

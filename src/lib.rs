@@ -18,3 +18,5 @@ pub mod redact;
 pub mod report;
 pub mod state;
 pub mod util;
+
+mod worker;

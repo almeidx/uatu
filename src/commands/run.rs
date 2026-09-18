@@ -3,6 +3,7 @@
 //! observability failure may prevent or alter the job's execution.
 
 use std::ffi::OsString;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -181,25 +182,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     // ----- signal handling -----
     // Installed before the run row and the child: from the moment a run is
     // observable, SIGTERM/SIGINT/SIGHUP get the orderly TERM-then-KILL path.
-    let (sig_tx, sig_rx) = mpsc::channel::<i32>();
-    let signals_handle = {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        match signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
-            Ok(mut signals) => {
-                let handle = signals.handle();
-                std::thread::spawn(move || {
-                    for sig in signals.forever() {
-                        let _ = sig_tx.send(sig);
-                    }
-                });
-                Some(handle)
-            }
-            Err(e) => {
-                warn(&format!("cannot install signal handlers: {e}"));
-                None
-            }
-        }
-    };
+    let mut signals = install_signals();
 
     // ----- record run start (liveness identity: SPEC §6) -----
     let me = liveness::current();
@@ -294,7 +277,24 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     }
 
     // ----- spawn child in a new process group (SPEC §6) -----
+    // Both readers must exist before the child can write into either pipe.
+    // If reservation fails, run once with inherited output and retain history.
+    let stop = Arc::new(AtomicBool::new(false));
+    let pumps = match reserve_pumps(&stop) {
+        Ok(pumps) => Some(pumps),
+        Err(e) => {
+            let note =
+                format!("cannot start output workers: {e}; output inherited, capture disabled");
+            warn(&note);
+            preflight_note = Some(note);
+            capture_enabled = false;
+            None
+        }
+    };
     let mut command = build_command(&args.cmd, mode, &eff);
+    if pumps.is_none() {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -335,27 +335,27 @@ pub fn cmd_run(args: RunArgs) -> i32 {
         capture_dir_err = Some(format!("cannot create output dir: {e}"));
         capture_enabled = false;
     }
-    let stop = Arc::new(AtomicBool::new(false));
-    let stdout_pipe = child.stdout.take().expect("stdout piped");
-    let stderr_pipe = child.stderr.take().expect("stderr piped");
-    let (out_pump, out_capture) = start_stream(
-        stdout_pipe,
-        libc::STDOUT_FILENO,
-        capture_enabled && eff.capture_stdout,
-        &eff,
-        run_dir.join("stdout.log"),
-        &redactor,
-        &stop,
-    );
-    let (err_pump, err_capture) = start_stream(
-        stderr_pipe,
-        libc::STDERR_FILENO,
-        capture_enabled && eff.capture_stderr,
-        &eff,
-        run_dir.join("stderr.log"),
-        &redactor,
-        &stop,
-    );
+    let (out_pump, err_pump, out_capture, err_capture) = if let Some((out, err)) = pumps {
+        let (out_pump, out_capture) = start_stream(
+            out,
+            child.stdout.take().expect("stdout piped").into(),
+            capture_enabled && eff.capture_stdout,
+            &eff,
+            run_dir.join("stdout.log"),
+            &redactor,
+        );
+        let (err_pump, err_capture) = start_stream(
+            err,
+            child.stderr.take().expect("stderr piped").into(),
+            capture_enabled && eff.capture_stderr,
+            &eff,
+            run_dir.join("stderr.log"),
+            &redactor,
+        );
+        (Some(out_pump), Some(err_pump), out_capture, err_capture)
+    } else {
+        (None, None, None, None)
+    };
 
     // ----- supervise (timeout, long-run, interruption) -----
     let started = Instant::now();
@@ -364,6 +364,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
     let mut timeout_fired = false;
     let mut interrupted_by: Option<&'static str> = None;
     let mut long_run_thread: Option<std::thread::JoinHandle<()>> = None;
+    let mut long_run_deferred = false;
 
     let exit_status: ExitStatus = loop {
         match child.try_wait() {
@@ -375,7 +376,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
         }
         // Interruption of the wrapper itself (SPEC §3): TERM-then-KILL the
         // group, record the child's real result, enqueue-only, exit promptly.
-        if let Ok(sig) = sig_rx.recv_timeout(Duration::from_millis(50)) {
+        if let Some(sig) = wait_for_signal(&mut signals) {
             interrupted_by = Some(signal_name(sig));
             let status = term_then_kill(&mut child, child_pid, eff.kill_grace);
             break status;
@@ -392,7 +393,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             && Instant::now() >= t
         {
             long_run_at = None; // once per run (SPEC §6)
-            long_run_thread = fire_long_run(
+            match fire_long_run(
                 &paths.db,
                 &cfg,
                 &run_id,
@@ -402,43 +403,40 @@ pub fn cmd_run(args: RunArgs) -> i32 {
                 eff.expected_from_cli,
                 &oplog,
                 db_ok,
-            );
+            ) {
+                Ok(task) => long_run_thread = task,
+                Err(e) => {
+                    warn(&format!(
+                        "cannot start long-run reporter: {e}; notifications will be queued after the child exits"
+                    ));
+                    long_run_deferred = true;
+                }
+            }
             if db_ok {
                 let _ = db.set_long_run_fired(&run_id);
             }
         }
     };
 
-    if let Some(h) = signals_handle {
-        h.close();
-    }
+    drop(signals);
 
     // ----- drain pumps -----
     // EOF arrives immediately unless a detached child holds the pipe open;
     // in that case stop draining after a short grace (SPEC §6: detached
     // children are ignored, noted in metadata when detectable).
-    let drain_deadline = Instant::now() + Duration::from_secs(2);
-    let mut detached = false;
-    let (out_eof, err_eof) = loop {
-        if out_pump.is_finished() && err_pump.is_finished() {
-            stop.store(true, Ordering::SeqCst);
-            break (
-                out_pump.join().unwrap_or(false),
-                err_pump.join().unwrap_or(false),
-            );
+    let detached = if let (Some(out_pump), Some(err_pump)) = (out_pump, err_pump) {
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        while !(out_pump.is_finished() && err_pump.is_finished()) && Instant::now() < drain_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if Instant::now() >= drain_deadline {
-            stop.store(true, Ordering::SeqCst);
-            break (
-                out_pump.join().unwrap_or(false),
-                err_pump.join().unwrap_or(false),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
+        stop.store(true, Ordering::SeqCst);
+        let out_eof = out_pump.join().unwrap_or(false);
+        let err_eof = err_pump.join().unwrap_or(false);
+        !out_eof || !err_eof
+    } else {
+        false
     };
-    if !out_eof || !err_eof {
-        detached = true;
-    }
     let mut stdout_meta = join_capture(out_capture);
     let mut stderr_meta = join_capture(err_capture);
     if let Some(e) = &capture_dir_err {
@@ -516,6 +514,9 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             "failure" | "timeout" => events_to_send.push(Event::Failure),
             _ => {}
         }
+        if long_run_deferred {
+            events_to_send.push(Event::LongRun);
+        }
         deliver_run_events(
             &db,
             &cfg,
@@ -526,7 +527,7 @@ pub fn cmd_run(args: RunArgs) -> i32 {
             &job_id,
             &events_to_send,
             eff.expected_from_cli,
-            interrupted_by.is_some(),
+            interrupted_by.is_some() || long_run_deferred,
             end_ms,
             &redactor,
         );
@@ -583,19 +584,7 @@ fn run_passthrough(
         );
         return EXIT_INTERNAL;
     }
-    let (sig_tx, sig_rx) = mpsc::channel::<i32>();
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    let handle = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP])
-        .ok()
-        .map(|mut signals| {
-            let h = signals.handle();
-            std::thread::spawn(move || {
-                for sig in signals.forever() {
-                    let _ = sig_tx.send(sig);
-                }
-            });
-            h
-        });
+    let mut signals = install_signals();
 
     let mut command = build_command(&args.cmd, mode, eff);
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -621,7 +610,7 @@ fn run_passthrough(
             Ok(None) => {}
             Err(_) => {}
         }
-        if sig_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+        if wait_for_signal(&mut signals).is_some() {
             break term_then_kill(&mut child, child_pid, eff.kill_grace);
         }
         if let Some(t) = timeout_at
@@ -632,9 +621,7 @@ fn run_passthrough(
             break term_then_kill(&mut child, child_pid, eff.kill_grace);
         }
     };
-    if let Some(h) = handle {
-        h.close();
-    }
+    drop(signals);
     let (status_str, _, _, wrapper_exit) = classify_exit(&status, timeout_fired);
     let _ = (cfg, job_id, reporters_enabled, status_str);
     wrapper_exit
@@ -666,6 +653,26 @@ fn build_command(cmd: &[OsString], mode: ExecMode, eff: &Effective) -> Command {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.process_group(0); // new process group for signal fanout (SPEC §6)
     command
+}
+
+fn install_signals() -> Option<signal_hook::iterator::Signals> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    match signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            warn(&format!("cannot install signal handlers: {e}"));
+            None
+        }
+    }
+}
+
+fn wait_for_signal(signals: &mut Option<signal_hook::iterator::Signals>) -> Option<i32> {
+    // Poll on the supervisor's existing cadence, without a forwarding worker.
+    // Sleeping also bounds CPU use when installing the handlers failed.
+    std::thread::sleep(Duration::from_millis(50));
+    signals
+        .as_mut()
+        .and_then(|signals| signals.pending().next())
 }
 
 fn signal_name(sig: i32) -> &'static str {
@@ -719,17 +726,68 @@ fn classify_exit(
 
 type PumpHandle = std::thread::JoinHandle<bool>;
 
+struct PumpInput {
+    pipe: OwnedFd,
+    capture_tx: Option<mpsc::Sender<Vec<u8>>>,
+    raw_total: Arc<AtomicU64>,
+}
+
+struct ReservedPump {
+    input: Option<mpsc::Sender<PumpInput>>,
+    handle: Option<PumpHandle>,
+}
+
+impl ReservedPump {
+    fn new(name: &'static str, dest_fd: i32, stop: &Arc<AtomicBool>) -> std::io::Result<Self> {
+        let (input, rx) = mpsc::channel::<PumpInput>();
+        let stop = Arc::clone(stop);
+        let handle = crate::worker::spawn(name, move || match rx.recv() {
+            Ok(input) => pump(input.pipe, dest_fd, input.capture_tx, input.raw_total, stop),
+            Err(_) => true,
+        })?;
+        Ok(Self {
+            input: Some(input),
+            handle: Some(handle),
+        })
+    }
+
+    fn start(mut self, input: PumpInput) -> PumpHandle {
+        // A reserved worker only waits for this channel and cannot exit before
+        // receiving its input. Sending transfers descriptor ownership to it.
+        let _ = self.input.take().expect("reserved sender").send(input);
+        self.handle.take().expect("reserved worker")
+    }
+}
+
+impl Drop for ReservedPump {
+    fn drop(&mut self) {
+        self.input.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn reserve_pumps(stop: &Arc<AtomicBool>) -> std::io::Result<(ReservedPump, ReservedPump)> {
+    let stdout = ReservedPump::new("uatu-stdout", libc::STDOUT_FILENO, stop)?;
+    let stderr = ReservedPump::new("uatu-stderr", libc::STDERR_FILENO, stop)?;
+    Ok((stdout, stderr))
+}
+
+struct StreamCapture {
+    task: std::io::Result<CaptureTask>,
+    raw_total: Arc<AtomicU64>,
+}
+
 fn start_stream(
-    pipe: impl std::os::unix::io::IntoRawFd,
-    dest_fd: i32,
+    reserved: ReservedPump,
+    pipe: OwnedFd,
     capture: bool,
     eff: &Effective,
     capture_path: PathBuf,
     redactor: &Arc<Redactor>,
-    stop: &Arc<AtomicBool>,
-) -> (PumpHandle, Option<(CaptureTask, Arc<AtomicU64>)>) {
-    let raw_fd = pipe.into_raw_fd();
-    set_nonblocking(raw_fd);
+) -> (PumpHandle, Option<StreamCapture>) {
+    set_nonblocking(pipe.as_raw_fd());
     let raw_total = Arc::new(AtomicU64::new(0));
     let (tx, capture_task) = if capture {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -744,25 +802,40 @@ fn start_stream(
             rx,
             Arc::clone(&raw_total),
         );
-        (Some(tx), Some((task, Arc::clone(&raw_total))))
+        let tx = task.is_ok().then_some(tx);
+        (
+            tx,
+            Some(StreamCapture {
+                task,
+                raw_total: Arc::clone(&raw_total),
+            }),
+        )
     } else {
         (None, None)
     };
-    let stop = Arc::clone(stop);
-    let total = Arc::clone(&raw_total);
-    let handle = std::thread::spawn(move || pump(raw_fd, dest_fd, tx, total, stop));
+    let handle = reserved.start(PumpInput {
+        pipe,
+        capture_tx: tx,
+        raw_total,
+    });
     (handle, capture_task)
 }
 
-fn join_capture(task: Option<(CaptureTask, Arc<AtomicU64>)>) -> CaptureMeta {
-    match task {
-        Some((task, raw_total)) => {
-            let mut meta = task.handle.join().unwrap_or_default();
-            meta.bytes_total = raw_total.load(Ordering::SeqCst);
-            meta
-        }
-        None => CaptureMeta::default(),
-    }
+fn join_capture(capture: Option<StreamCapture>) -> CaptureMeta {
+    let Some(capture) = capture else {
+        return CaptureMeta::default();
+    };
+    let bytes_total = capture.raw_total.load(Ordering::SeqCst);
+    let mut meta = match capture.task {
+        Ok(task) => task.handle.join().unwrap_or_default(),
+        Err(e) => CaptureMeta {
+            bytes_omitted: bytes_total,
+            reason: Some(format!("cannot start capture worker: {e}")),
+            ..CaptureMeta::default()
+        },
+    };
+    meta.bytes_total = bytes_total;
+    meta
 }
 
 fn set_nonblocking(fd: i32) {
@@ -778,12 +851,13 @@ fn set_nonblocking(fd: i32) {
 /// arrive; capture sees a copy via an unbounded channel. Returns true on EOF
 /// (false = stopped while a detached child still held the pipe).
 fn pump(
-    src_fd: i32,
+    pipe: OwnedFd,
     dest_fd: i32,
     capture_tx: Option<mpsc::Sender<Vec<u8>>>,
     raw_total: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> bool {
+    let src_fd = pipe.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
     let mut eof = false;
     'outer: loop {
@@ -833,9 +907,6 @@ fn pump(
             break;
         }
     }
-    unsafe {
-        libc::close(src_fd);
-    }
     eof
 }
 
@@ -867,18 +938,18 @@ fn fire_long_run(
     expected_from_cli: bool,
     oplog: &OpLog,
     db_ok: bool,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> std::io::Result<Option<std::thread::JoinHandle<()>>> {
     oplog.warn(
         "long_run_detected",
         &format!("job {job_id} exceeded its expected duration"),
         &[("run_id", serde_json::json!(run_id))],
     );
     if !reporters_enabled || !db_ok {
-        return None;
+        return Ok(None);
     }
     let reporters = events::reporters_for_event(cfg, job_id, Event::LongRun, expected_from_cli);
     if reporters.is_empty() {
-        return None;
+        return Ok(None);
     }
     let db_path = db_path.to_path_buf();
     let cfg = cfg.clone();
@@ -886,7 +957,7 @@ fn fire_long_run(
     let job_id = job_id.to_string();
     let oplog = oplog.clone();
     let redactor = Arc::clone(redactor);
-    Some(std::thread::spawn(move || {
+    crate::worker::spawn("uatu-long-run", move || {
         let Ok(db) = Db::open(&db_path) else { return };
         let me = liveness::current();
         let now = now_ms();
@@ -924,7 +995,8 @@ fn fire_long_run(
                 report::deliver_row(&ctx, &row, report::per_reporter_budget());
             }
         }
-    }))
+    })
+    .map(Some)
 }
 
 /// Queue and synchronously attempt this run's immediate events first, then
@@ -943,7 +1015,7 @@ fn deliver_run_events(
     job_id: &str,
     events_to_send: &[Event],
     expected_from_cli: bool,
-    interrupted: bool,
+    enqueue_only: bool,
     digest_event_ms: i64,
     redactor: &Arc<Redactor>,
 ) {
@@ -992,8 +1064,9 @@ fn deliver_run_events(
                 oplog.warn("delivery_queue_failed", &msg, &[]);
                 break 'immediate;
             }
-            // Interrupted wrappers enqueue without sending (SPEC §3).
-            let (state, next, owner) = if interrupted {
+            // Interrupted wrappers and unavailable reporter workers enqueue
+            // without sending (SPEC §3).
+            let (state, next, owner) = if enqueue_only {
                 ("queued", Some(now), None)
             } else {
                 ("sending", None, Some(me))
@@ -1008,7 +1081,7 @@ fn deliver_run_events(
                 next,
                 owner,
             ) {
-                Ok(id) if !interrupted => own_rows.push(id),
+                Ok(id) if !enqueue_only => own_rows.push(id),
                 Ok(_) => {}
                 Err(e) => {
                     let msg = format!("cannot queue immediate alert via {reporter}: {e}");
@@ -1027,7 +1100,7 @@ fn deliver_run_events(
     }
     let _ = db.conn.busy_timeout(SQLITE_BUSY_BUDGET);
 
-    if interrupted {
+    if enqueue_only {
         queue_digest_with_budget(
             db,
             cfg,
@@ -1234,4 +1307,217 @@ fn finish_start_failure(
         }
     }
     code
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    const OUT: &[u8] = b"out:\0\xff\n";
+    const ERR: &[u8] = b"err:\0\xfe\n";
+
+    // Fault selection exists only in the unit-test binary. Running cmd_run in
+    // a subprocess isolates signal registrations and captures real raw fds.
+    #[test]
+    fn worker_failure_child() {
+        let Ok(failure) = std::env::var("UATU_TEST_WORKER_FAILURE") else {
+            return;
+        };
+        let worker = match failure.as_str() {
+            "stdout" => "uatu-stdout",
+            "stderr" => "uatu-stderr",
+            "capture" => "uatu-capture",
+            "long-run" => "uatu-long-run",
+            _ => panic!("unknown worker"),
+        };
+        crate::worker::FAIL_NAME.with(|name| name.set(Some(worker)));
+        let dir = PathBuf::from(std::env::var_os("UATU_TEST_DIR").unwrap());
+        let mode = std::env::var("UATU_TEST_MODE").unwrap();
+        let tail = match mode.as_str() {
+            "timeout" | "interrupt" => "while :; do sleep 1; done",
+            "long-run" => "sleep 0.3; exit 37",
+            _ => "exit 37",
+        };
+        let script = format!(
+            "trap 'exit 37' TERM; printf 'out:\\000\\377\\n'; printf 'err:\\000\\376\\n' >&2; printf x >> \"$UATU_TEST_MARKER\"; {tail}"
+        );
+        let code = cmd_run(RunArgs {
+            name: Some("worker-failure".into()),
+            shell: false,
+            config: Some(dir.join("config.toml")),
+            data_dir: Some(dir.join("state")),
+            cwd: None,
+            env: vec![(
+                "UATU_TEST_MARKER".into(),
+                dir.join("started").to_string_lossy().into_owned(),
+            )],
+            timeout: (mode == "timeout").then_some(Duration::from_millis(150)),
+            kill_grace: Some(Duration::from_millis(300)),
+            expected_duration: (mode == "long-run").then_some(Duration::from_millis(20)),
+            cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        });
+        std::process::exit(code);
+    }
+
+    fn run_failure(failure: &str, mode: &str) -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            if mode == "long-run" {
+                "[global]\nmin_free_bytes = \"0 B\"\n[notify]\nevents = [\"long_run\"]\nreporters = [\"discord.d\"]\n[reporters.discord.d]\nwebhook_url = \"http://127.0.0.1:1/unreachable\"\n"
+            } else {
+                "[global]\nmin_free_bytes = \"0 B\"\n"
+            },
+        ).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::run::tests::worker_failure_child",
+                "--nocapture",
+            ])
+            .env("UATU_TEST_WORKER_FAILURE", failure)
+            .env("UATU_TEST_MODE", mode)
+            .env("UATU_TEST_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("xdg"))
+            .env("UATU_OVERALL_BUDGET_MS", "300")
+            .env("UATU_PER_REPORTER_BUDGET_MS", "100")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut interrupted = false;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if mode == "interrupt" && !interrupted && dir.path().join("started").exists() {
+                assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+                interrupted = true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("worker-failure run did not finish: {failure}/{mode}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if mode == "timeout" { 124 } else { 37 }),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The unit-test harness writes its heading before the helper starts;
+        // the helper exits directly, leaving the child's bytes as the suffix.
+        assert!(output.stdout.ends_with(OUT), "stdout: {:?}", output.stdout);
+        assert_eq!(
+            output
+                .stdout
+                .windows(OUT.len())
+                .filter(|w| *w == OUT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .stderr
+                .windows(ERR.len())
+                .filter(|w| *w == ERR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("started")).unwrap(),
+            b"x",
+            "child executed exactly once"
+        );
+        let db = Db::open(&dir.path().join("state/uatu.db")).unwrap();
+        let (count, exit): (u32, i32) = db
+            .conn
+            .query_row("SELECT COUNT(*), exit_code FROM runs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(exit, if mode == "timeout" { 124 } else { 37 });
+        (dir, db)
+    }
+
+    #[test]
+    fn failed_pump_reservation_preserves_output_exit_and_history() {
+        for failure in ["stdout", "stderr"] {
+            let (_dir, db) = run_failure(failure, "normal");
+            let (reason, stored, detached): (String, i64, bool) = db
+                .conn
+                .query_row(
+                    "SELECT stdout_reason, stdout_bytes_stored, detached_children FROM runs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert!(reason.contains("cannot start output workers"));
+            assert_eq!(stored, 0);
+            assert!(!detached);
+        }
+    }
+
+    #[test]
+    fn failed_pump_reservation_retains_timeout_and_interruption() {
+        for failure in ["stdout", "stderr"] {
+            let (_dir, db) = run_failure(failure, "timeout");
+            let timed_out: bool = db
+                .conn
+                .query_row("SELECT timeout_fired FROM runs", [], |row| row.get(0))
+                .unwrap();
+            assert!(timed_out);
+            let (_dir, db) = run_failure(failure, "interrupt");
+            let signal: String = db
+                .conn
+                .query_row("SELECT interrupted_by FROM runs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(signal, "SIGTERM");
+        }
+    }
+
+    #[test]
+    fn failed_capture_workers_preserve_output_and_record_omitted_bytes() {
+        let (_dir, db) = run_failure("capture", "normal");
+        for stream in ["stdout", "stderr"] {
+            let (total, stored, omitted, reason, path): (i64, i64, i64, String, Option<String>) = db.conn.query_row(
+                &format!("SELECT {stream}_bytes_total, {stream}_bytes_stored, {stream}_bytes_omitted, {stream}_reason, {stream}_path FROM runs"), [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+            assert_eq!(total, OUT.len() as i64);
+            assert_eq!(stored, 0);
+            assert_eq!(omitted, total);
+            assert!(reason.contains("cannot start capture worker"));
+            assert!(path.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_long_run_worker_queues_delivery_after_child_exit() {
+        let (_dir, db) = run_failure("long-run", "long-run");
+        let fired: bool = db
+            .conn
+            .query_row("SELECT long_run_fired FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert!(fired);
+        let (event, state, attempts): (String, String, u32) = db
+            .conn
+            .query_row(
+                "SELECT event, state, attempt_count FROM deliveries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event, "long_run");
+        assert_eq!(state, "queued");
+        assert_eq!(
+            attempts, 0,
+            "failed worker must not trigger synchronous network work"
+        );
+    }
 }

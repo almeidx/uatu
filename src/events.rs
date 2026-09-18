@@ -127,17 +127,11 @@ pub fn lookup_reporter<'a>(cfg: &'a Config, full_name: &str) -> Option<ReporterR
 /// Per-reporter events filter; default: all events (SPEC §4).
 pub fn reporter_accepts(cfg: &Config, full_name: &str, event: Event) -> bool {
     let events = match lookup_reporter(cfg, full_name) {
-        Some(ReporterRef::Discord(d)) => d.events.clone(),
-        Some(ReporterRef::Smtp(s)) => s.events.clone(),
+        Some(ReporterRef::Discord(d)) => d.events.as_deref(),
+        Some(ReporterRef::Smtp(s)) => s.events.as_deref(),
         None => return false,
     };
-    match events {
-        None => true,
-        Some(list) => {
-            let mut w = Vec::new();
-            parse_events(&list, &mut w).contains(&event)
-        }
-    }
+    events.is_none_or(|list| parse_events(list, &mut Vec::new()).contains(&event))
 }
 
 /// Effective delivery targets for a (job, event): the event must be in the
