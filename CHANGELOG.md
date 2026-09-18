@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.1.1-alpha.9] - 2026-09-18
+
+- deps: Lock file maintenance (#56)
+- deps: Update patch/minor dependencies (#55)
+- fix: limit digest successes and clarify omission counts
+- deps: Lock file maintenance (#54)
+- deps: Update patch/minor dependencies (#53)
+- deps: Lock file maintenance (#52)
+- deps: Update Rust crate toml to 1.1.5 (#51)
+
+
 ## [0.1.1-alpha.8] - 2026-09-02
 
 - deps: Lock file maintenance (#49)
