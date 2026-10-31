@@ -323,7 +323,7 @@ impl Db {
 
     fn open_once_bounded(path: &Path, deadline: std::time::Instant) -> Result<Db, StateError> {
         let conn = Connection::open(path)?;
-        let db = Db { conn };
+        let mut db = Db { conn };
         db.set_remaining_busy_timeout(deadline)?;
         db.conn
             .progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
