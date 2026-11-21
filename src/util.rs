@@ -127,7 +127,7 @@ pub fn rfc3339(ms: i64) -> String {
 pub fn local_time(ms: i64) -> String {
     match Timestamp::from_millisecond(ms) {
         Ok(ts) => ts
-            .to_zoned(jiff::tz::TimeZone::system())
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
             .strftime("%Y-%m-%d %H:%M:%S %:z")
             .to_string(),
         Err(_) => format!("<invalid timestamp {ms}>"),
